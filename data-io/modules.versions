@@ -1,0 +1,14 @@
+# Source of truth for nf-mod-* submodule versions.
+# Renovate reads this file and proposes updates when new releases exist.
+#
+# Format (one per line):
+#   <module-repo-name>=<version-tag>
+#
+# Only the modules with a published release are pinned. nf-mod-minimap2,
+# nf-mod-dorado and nf-mod-utils have no tags yet (manifest version 0.0.0), so
+# their submodules track the default branch and their images are pinned to
+# :latest in nextflow.config. Pin them here once they cut a release.
+
+nf-mod-bwa=v1.0.0
+nf-mod-samtools=v1.0.0
+nf-mod-parabricks=v1.0.0

@@ -1,0 +1,43 @@
+
+
+## input directories
+HOT-STORAGE-DIR = /mnt/lustre/projects/bioinformatics/
+COLD-STORAGE-DIR = /mnt/user-data/cristian-soitu/bioinformatics
+
+## hot storage paths
+INPUT-ONT-DIR-HOT = ${HOT-STORAGE-DIR}/tests/data-io/input/ont/
+INPUT-PACBIO-DIR-HOT = ${HOT-STORAGE-DIR}/tests/data-io/input/pacbio/
+INPUT-ILLUMINA-DIR-HOT = ${HOT-STORAGE-DIR}/tests/data-io/input/illumina/
+
+# output directories are relative to the input directories, so that they can be easily moved to a different location
+OUTPUT-ONT-DIR-HOT = ${INPUT-ONT-DIR-HOT}/../../output/ont/
+OUTPUT-PACBIO-DIR-HOT = ${INPUT-PACBIO-DIR-HOT}/../../output/pacbio/
+OUTPUT-ILLUMINA-DIR-HOT = ${INPUT-ILLUMINA-DIR-HOT}/../../output/illumina/
+
+REFERENCE-ONT-HOT = ${HOT-STORAGE-DIR}/references/other/simon_methylation/wt-0248-tdk_kan.fa
+REFERENCE-PACBIO-HOT = ${HOT-STORAGE-DIR}/references/plasmids/plasmids/pFR494_pRT300_rham_wt.fa
+REFERENCE-ILLUMINA-HOT = ${HOT-STORAGE-DIR}/references/ecoli/syn57/syn57_evo/Syn57_evo2.fa
+
+# create output directories if they do not exist
+mkdir -p ${OUTPUT-ONT-DIR-HOT}
+mkdir -p ${OUTPUT-PACBIO-DIR-HOT}
+mkdir -p ${OUTPUT-ILLUMINA-DIR-HOT}
+
+
+
+## cold storage paths
+INPUT-ONT-DIR-COLD = ${COLD-STORAGE-DIR}/tests/data-io/input/ont/
+INPUT-PACBIO-DIR-COLD = ${COLD-STORAGE-DIR}/tests/data-io/input/pacbio/
+INPUT-ILLUMINA-DIR-COLD = ${COLD-STORAGE-DIR}/tests/data-io/input/illumina/
+
+OUTPUT-ONT-DIR-COLD = ${INPUT-ONT-DIR-COLD}/../../output/ont/
+OUTPUT-PACBIO-DIR-COLD = ${INPUT-PACBIO-DIR-COLD}/../../output/pacbio/
+OUTPUT-ILLUMINA-DIR-COLD = ${INPUT-ILLUMINA-DIR-COLD}/../../output/illumina/
+
+REFERENCE-ONT-COLD = ${COLD-STORAGE-DIR}/references/other/simon_methylation/wt-0248-tdk_kan.fa
+REFERENCE-PACBIO-COLD = ${COLD-STORAGE-DIR}/references/plasmids/plasmids/pFR494_pRT300_rham_wt.fa
+REFERENCE-ILLUMINA-COLD = ${COLD-STORAGE-DIR}/references/ecoli/syn57/syn57_evo/Syn57_evo2.fa
+
+mkdir -p ${OUTPUT-ONT-DIR-COLD}
+mkdir -p ${OUTPUT-PACBIO-DIR-COLD}
+mkdir -p ${OUTPUT-ILLUMINA-DIR-COLD}

@@ -1,0 +1,18 @@
+[submodule "data-io/modules/bwa"]
+	path = data-io/modules/bwa
+	url = https://github.com/eit-gbi/nf-mod-bwa.git
+[submodule "data-io/modules/samtools"]
+	path = data-io/modules/samtools
+	url = https://github.com/eit-gbi/nf-mod-samtools.git
+[submodule "data-io/modules/minimap2"]
+	path = data-io/modules/minimap2
+	url = https://github.com/eit-gbi/nf-mod-minimap2.git
+[submodule "data-io/modules/parabricks"]
+	path = data-io/modules/parabricks
+	url = https://github.com/eit-gbi/nf-mod-parabricks.git
+[submodule "data-io/modules/dorado"]
+	path = data-io/modules/dorado
+	url = https://github.com/eit-gbi/nf-mod-dorado.git
+[submodule "data-io/modules/utils"]
+	path = data-io/modules/utils
+	url = https://github.com/eit-gbi/nf-mod-utils.git
