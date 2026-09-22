@@ -1,0 +1,4 @@
+# Nextflow leaves these wherever it is launched
+.nextflow/
+.nextflow.log*
+work/

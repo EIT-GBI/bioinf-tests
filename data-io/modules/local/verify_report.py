@@ -87,7 +87,7 @@ for tier in ("hot", "cold"):
         say("   %-5s no files large enough to time." % tier)
 say("   Indicative only: this run reads BOTH tiers at once, so hot and cold")
 say("   tasks compete with each other as well as with their own siblings.")
-say("   The timing evidence is `-entry report`, where one tier runs at a time.")
+say("   The timing evidence is `--arm report`, where one tier runs at a time.")
 
 say()
 say("=" * 62)

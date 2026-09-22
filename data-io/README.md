@@ -11,12 +11,12 @@ See [PLAN.md](PLAN.md) for the reasoning behind the design.
 
 ---
 
-## Everything is `nextflow run main.nf -entry <arm>`
+## Everything is `nextflow run main.nf --arm <arm>`
 
 There are no helper scripts and nothing to run before or after. Each arm builds
 its own samplesheet, writes its own trace, and reports its own result.
 
-| `-entry` | What it does | Tier |
+| `--arm` | What it does | Tier |
 |---|---|---|
 | `verify` | reads every input on **both** tiers, N times, checksums and times them | both |
 | `illumina` | bwa mem → index → flagstat | `--tier` |
@@ -55,18 +55,85 @@ subdirectory, so every command carries `-main-script data-io/main.nf`:
 
 ```bash
 nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf \
-  -entry verify -profile cluster -resume
+  --arm verify -profile cluster -resume
 ```
 
 `-latest` re-pulls the newest commit on the default branch. Without it Nextflow
 silently reuses whatever it cached the first time.
 
-> **Launch from `/mnt/lustre/projects/bioinformatics/runs`**, not from an
-> Alluxio path. Nextflow writes `results/` (traces and reports) relative to
-> wherever you launch, and `-entry report` reads every trace it finds there —
-> so keeping every run in one launch directory is what makes the hot-vs-cold
-> table complete. It also needs normal POSIX semantics, which Alluxio may not
-> give it.
+> **Why `--arm` and not `-entry`.** Nextflow 26's strict syntax removed
+> `-entry` and tells you to "use a param to run a named workflow from the entry
+> workflow", which is what `main.nf` does. The same command therefore works on
+> 25.x and 26.x. That strict parser also rejects `def` at the top level of a
+> config or script, so neither file uses one.
+
+### One-time: GitHub access on the cluster
+
+This repo and three of its tool modules (`nf-mod-minimap2`, `nf-mod-dorado`,
+`nf-mod-utils`) are **private**. Nextflow reaches GitHub through its own API
+client and ignores `gh auth`, git's credential helper and SSH keys, so without
+credentials it reports:
+
+```
+Remote resource not found: https://api.github.com/repos/EIT-GBI/bioinf-tests/contents/data-io/main.nf
+```
+
+That is a 404 standing in for "no access" — GitHub hides private repos from
+unauthenticated callers rather than returning 403. Give Nextflow a token
+**without writing one into a file**:
+
+```bash
+# ~/.nextflow/scm  — no secret in here, just your username and an env var name
+providers {
+    github {
+        user     = 'cristian-soitu'
+        password = System.getenv('GITHUB_TOKEN')
+    }
+}
+```
+
+```bash
+chmod 600 ~/.nextflow/scm
+```
+
+Mint a **classic** token with `repo` scope at
+<https://github.com/settings/tokens>, then put it in your environment — typed,
+not written down:
+
+```bash
+read -rsp 'GitHub token: ' GITHUB_TOKEN && export GITHUB_TOKEN && echo
+```
+
+`read` does not reach your shell history, and the token lives only in that
+session. `sbatch` exports your environment by default, so a job submitted from
+that shell inherits it — including a week-long matrix run, since the value is
+captured at submit time. A new login means entering it again.
+
+(`gh auth token` is the shortcut if the GitHub CLI happens to be installed, but
+it is not on the cluster and is not worth installing for this.)
+
+The same token covers the private submodules, so there is nothing further to
+set up — as long as it carries the `repo` scope. A **fine-grained** PAT must
+list all four repositories (`bioinf-tests`, `nf-mod-minimap2`, `nf-mod-dorado`,
+`nf-mod-utils`) or the main clone succeeds and the submodule fetch fails.
+
+> **If the submodules come back empty** (an include fails on a missing
+> `modules/...` path), the cause is the repo-root `nextflow.config`, which
+> exists solely to carry `manifest.recurseSubmodules = true`. Nextflow reads
+> only the root manifest when cloning, so that flag cannot live in
+> `data-io/nextflow.config`.
+
+**Alternative, if you would rather not hand Nextflow a token at all:** clone
+once to a shared location and run it by path. `-main-script` works the same way,
+and `-latest` becomes a `git pull` in that directory.
+
+```bash
+git clone --recursive git@github.com:EIT-GBI/bioinf-tests.git \
+  /mnt/lustre/projects/bioinformatics/src/bioinf-tests
+
+nextflow run /mnt/lustre/projects/bioinformatics/src/bioinf-tests \
+  -main-script data-io/main.nf --arm verify -profile cluster -resume
+```
 
 The only manual step is staging the reads into
 `<root>/tests/data-io/input/<platform>/` on both tiers. Samplesheets are built
@@ -83,11 +150,6 @@ References must already be indexed **on both tiers** (`.amb .ann .bwt .pac .sa`
 for Illumina, `.fai` for all three). Index building is not part of the
 measurement and no timed arm does it.
 
-> **The tool modules are git submodules.** `manifest.recurseSubmodules` tells
-> Nextflow to fetch them on pull. Confirm that works on the first remote run —
-> if an include fails with a missing `modules/...` path, fall back to a
-> `git clone --recursive` and run `main.nf` by path.
-
 ## Run it on the cluster
 
 Hand the Nextflow driver to SLURM rather than running it in your terminal:
@@ -98,7 +160,7 @@ cd       /mnt/lustre/projects/bioinformatics/runs   # results/ lands here
 
 sbatch -J nf-io -p cpu -t 2-00:00:00 --wrap="\
   nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf \
-    -entry illumina -profile cluster --tier hot --rep 1 -resume"
+    --arm illumina -profile cluster --tier hot --rep 1 -resume"
 ```
 
 Watch it with `squeue -u $USER` and `tail -f slurm-<jobid>.out`.
@@ -114,10 +176,10 @@ Watch it with `squeue -u $USER` and `tail -f slurm-<jobid>.out`.
 | `nextflow run EIT-GBI/bioinf-tests` | Pulls the pipeline from GitHub — no clone. |
 | `-latest` | Re-pull the newest commit. Without it, Nextflow reuses its cached copy. |
 | `-main-script data-io/main.nf` | The pipeline is in a subdirectory of the repo. |
-| `-entry illumina` | Which arm of `main.nf` to run. It takes one name. |
+| `--arm illumina` | Which arm of `main.nf` to run. One per run. |
 | `-profile cluster` | SLURM executor + Apptainer containers. |
 | `--tier hot` | Which storage tier to read. Omit and it defaults to `hot`. |
-| `--rep 1` | Repeat number. It only labels the trace file, so `-entry report` can tell reps apart. |
+| `--rep 1` | Repeat number. It only labels the trace file, so `--arm report` can tell reps apart. |
 | `-resume` | Reuse cached tasks after a crash instead of redoing hours of work. |
 
 > **What `-resume` does to the numbers.** It is there so a driver that dies six
@@ -138,18 +200,18 @@ cd /mnt/lustre/projects/bioinformatics/runs
 # -resume lives in $NF, so every line below runs with it
 NF="nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf -profile cluster -resume"
 
-sbatch -J nf-io -p cpu -t 7-00:00:00 --wrap="
-  $NF -entry verify
+sbatch -J nf-io -p cpu -t 4-00:00:00 --wrap="
+  $NF --arm verify
   for rep in 1 2 3; do
     for tier in hot cold; do
-      $NF -entry illumina --tier \$tier --rep \$rep
-      $NF -entry pacbio   --tier \$tier --rep \$rep --pacbio.device cpu
-      $NF -entry pacbio   --tier \$tier --rep \$rep --pacbio.device gpu
-      $NF -entry ont      --tier \$tier --rep \$rep
+      $NF --arm illumina --tier \$tier --rep \$rep
+      $NF --arm pacbio   --tier \$tier --rep \$rep --pacbio.device cpu
+      $NF --arm pacbio   --tier \$tier --rep \$rep --pacbio.device gpu
+      $NF --arm ont      --tier \$tier --rep \$rep
     done
   done
-  $NF -entry compare
-  $NF -entry report
+  $NF --arm compare
+  $NF --arm report
 "
 ```
 
@@ -171,12 +233,12 @@ It reads every input on both tiers, `--verify.reps` times each, then reports:
 3. **Failed reads and format checks** (`gzip -t`, `samtools quickcheck`), which
    tell a truncated read from a mangled one.
 4. **Throughput** — indicative only. This arm reads both tiers at once, so hot
-   and cold tasks compete with each other. The timing evidence is `-entry
+   and cold tasks compete with each other. The timing evidence is `--arm
    report`, where one tier runs at a time.
 
 ```bash
 nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf \
-  -entry verify -profile cluster -resume
+  --arm verify -profile cluster -resume
 
 cat results/verify-report.txt
 ```

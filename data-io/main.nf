@@ -3,12 +3,18 @@
 // ---------------------------------------------------------------------------
 // data-io - hot (Lustre) vs cold (Alluxio) storage IO benchmark
 // ---------------------------------------------------------------------------
-//   nextflow run main.nf -entry verify                  # both tiers, integrity
-//   nextflow run main.nf -entry illumina --tier hot
-//   nextflow run main.nf -entry pacbio   --tier cold --pacbio.device gpu
-//   nextflow run main.nf -entry ont      --tier hot
-//   nextflow run main.nf -entry compare                 # hot vs cold outputs
-//   nextflow run main.nf -entry report                  # timing table
+//   nextflow run main.nf --arm verify                   # both tiers, integrity
+//   nextflow run main.nf --arm illumina --tier hot
+//   nextflow run main.nf --arm pacbio   --tier cold --pacbio.device gpu
+//   nextflow run main.nf --arm ont      --tier hot
+//   nextflow run main.nf --arm compare                  # hot vs cold outputs
+//   nextflow run main.nf --arm report                   # timing table
+//
+// The arm is a parameter, not `-entry`. Nextflow 26's strict syntax removed
+// `-entry` and says to "use a param to run a named workflow from the entry
+// workflow", which is what the dispatch below does. It also works on older
+// Nextflow, and it puts the arm in `params`, so the config can name the trace
+// files and output directories after it.
 //
 // Nothing to run before or after: stage the reads into
 // <root>/tests/data-io/input/<platform>/ and each arm builds its own
@@ -59,25 +65,36 @@ def outputDir(tier) { "${params.hot_root}/${params.test_subdir}/output/${tier}" 
 
 
 // ---------------------------------------------------------------------------
-// No -entry given
+// Entry point: pick an arm
 // ---------------------------------------------------------------------------
-// Nextflow's own message here is just "No entry workflow specified", which does
-// not say what the choices are.
 workflow {
-    error """
-    Pick an arm with -entry:
 
-      nextflow run main.nf -entry verify   -profile cluster                  both tiers, integrity
-      nextflow run main.nf -entry illumina -profile cluster --tier hot       bwa mem
-      nextflow run main.nf -entry pacbio   -profile cluster --tier hot       minimap2 (--pacbio.device gpu for Parabricks)
-      nextflow run main.nf -entry ont      -profile cluster --tier hot       dorado sup
-      nextflow run main.nf -entry compare  -profile cluster                  hot vs cold BAM bodies
-      nextflow run main.nf -entry report   -profile cluster                  timing table
+    // Declared inside the workflow: Nextflow 26's strict syntax allows function
+    // declarations at the top level but not variable assignments.
+    def arms = ['verify', 'illumina', 'pacbio', 'ont', 'compare', 'report']
 
-    One arm per run, on purpose - see the header of this file and README.md.
-    To submit the whole matrix as a single job, see "The whole matrix in one
-    submission" in README.md.
-    """.stripIndent()
+    if (!(params.arm in arms)) {
+        error """
+        |${params.arm ? "Unknown --arm '${params.arm}'." : 'No --arm given.'}
+        |
+        |  --arm verify     both tiers, integrity + throughput      (no --tier)
+        |  --arm illumina   bwa mem                                 --tier hot|cold
+        |  --arm pacbio     minimap2, or Parabricks with --pacbio.device gpu
+        |  --arm ont        dorado sup basecalling + aligner        --tier hot|cold
+        |  --arm compare    hot vs cold BAM bodies                  (no --tier)
+        |  --arm report     timing table across every run so far    (no --tier)
+        |
+        |One arm per run, on purpose - see the header of this file and README.md.
+        |For the whole matrix in a single job, see README.md.
+        """.stripMargin()
+    }
+
+    if (params.arm == 'verify')        { verify()   }
+    else if (params.arm == 'illumina') { illumina() }
+    else if (params.arm == 'pacbio')   { pacbio()   }
+    else if (params.arm == 'ont')      { ont()      }
+    else if (params.arm == 'compare')  { compare()  }
+    else if (params.arm == 'report')   { report()   }
 }
 
 
@@ -326,29 +343,32 @@ workflow compare {
     def hot_out  = outputDir('hot')
     def cold_out = outputDir('cold')
 
-    // Every arm publishes its BAM to alignment/ (see nextflow.config), so one
-    // glob covers all three without knowing which arm ran.
-    def hot_bams  = files("${hot_out}/alignment/*.bam")
-    def cold_bams = files("${cold_out}/alignment/*.bam")
+    // Each arm publishes under its own directory (see nextflow.config), so the
+    // glob spans them and the key keeps them apart: pacbio-cpu is paired with
+    // pacbio-cpu, not with pacbio-gpu.
+    def hot_bams  = files("${hot_out}/*/alignment/*.bam")
+    def cold_bams = files("${cold_out}/*/alignment/*.bam")
 
     if (!hot_bams && !cold_bams) {
         error """No BAMs to compare.
-        |  hot : ${hot_out}/alignment/
-        |  cold: ${cold_out}/alignment/
+        |  hot : ${hot_out}/*/alignment/
+        |  cold: ${cold_out}/*/alignment/
         |Run a workload arm on both tiers first.""".stripMargin()
     }
 
     // join silently drops a BAM that exists on only one tier, so say so here.
     // That case means an arm ran on one tier and not the other, which would
     // otherwise look like a clean comparison of however many were left.
-    def unpaired = ((hot_bams*.name as Set) - (cold_bams*.name as Set)) +
-                   ((cold_bams*.name as Set) - (hot_bams*.name as Set))
+    // Key on the path below the tier's output dir, e.g. "illumina/alignment/x.bam"
+    def hot_keys  = hot_bams.collect  { f -> f.toString() - "${hot_out}/"  } as Set
+    def cold_keys = cold_bams.collect { f -> f.toString() - "${cold_out}/" } as Set
+    def unpaired  = (hot_keys - cold_keys) + (cold_keys - hot_keys)
     if (unpaired) {
         log.warn "not compared, present on only one tier: ${unpaired.sort().join(', ')}"
     }
 
-    hot_ch  = channel.fromList(hot_bams).map  { f -> tuple(f.name, f) }
-    cold_ch = channel.fromList(cold_bams).map { f -> tuple(f.name, f) }
+    hot_ch  = channel.fromList(hot_bams).map  { f -> tuple(f.toString() - "${hot_out}/",  f) }
+    cold_ch = channel.fromList(cold_bams).map { f -> tuple(f.toString() - "${cold_out}/", f) }
 
     COMPARE_BAM(hot_ch.join(cold_ch))
 

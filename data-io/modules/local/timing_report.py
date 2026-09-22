@@ -3,8 +3,8 @@
 
 Usage: timing_report.py          (reads trace-*.txt in the working directory)
 
-The tier and rep come from each trace's filename, which is why no bookkeeping
-file is needed to know what a trace was.
+The arm, tier and rep come from each trace's filename, which is why no
+bookkeeping file is needed to know what a trace was.
 """
 
 import collections
@@ -17,7 +17,7 @@ import statistics
 # Processes that are scaffolding rather than workload
 SKIP = re.compile(r"PREPARE_SAMPLESHEET|VERIFY_|COMPARE_|TIMING_")
 
-FIELDS = ["tier", "rep", "process", "sample", "realtime_s", "cpu_pct",
+FIELDS = ["arm", "tier", "rep", "process", "sample", "realtime_s", "cpu_pct",
           "read_mb", "write_mb", "read_mb_per_s"]
 
 
@@ -33,10 +33,10 @@ def num(v):
 traces = sorted(glob.glob("trace-*.txt"))
 tasks = []
 for path in traces:
-    m = re.match(r"trace-(hot|cold)-rep(\d+)-", os.path.basename(path))
+    m = re.match(r"trace-(\w+)-(hot|cold)-rep(\d+)-", os.path.basename(path))
     if not m:
         continue
-    tier, rep = m.group(1), m.group(2)
+    arm, tier, rep = m.group(1), m.group(2), m.group(3)
     for r in csv.DictReader(open(path), delimiter="\t"):
         name = r["process"].split(":")[-1]   # named workflows prefix the process
         if SKIP.search(name) or r.get("status") != "COMPLETED":
@@ -45,7 +45,7 @@ for path in traces:
         read_mb = num(r["read_bytes"]) / 1048576.0    # raw trace: bytes
         write_mb = num(r["write_bytes"]) / 1048576.0
         tasks.append(dict(
-            tier=tier, rep=rep, process=name, sample=r["tag"],
+            arm=arm, tier=tier, rep=rep, process=name, sample=r["tag"],
             realtime_s=round(realtime, 1), cpu_pct=num(r["%cpu"]),
             read_mb=round(read_mb, 1), write_mb=round(write_mb, 1),
             read_mb_per_s=round(read_mb / realtime, 1) if realtime else 0))

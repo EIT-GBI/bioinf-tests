@@ -34,7 +34,7 @@ data-io/
   PLAN.md
   README.md              # setup, run commands, how to read results
   paths.txt              # human-readable notes (existing)
-  main.nf                # six arms, picked with -entry:
+  main.nf                # six arms, picked with --arm:
                          #   verify   - integrity + throughput, BOTH tiers
                          #   illumina - bwa mem -> index -> flagstat
                          #   pacbio   - (ubam->fastq) -> minimap2 | pbrun
@@ -52,7 +52,7 @@ data-io/
 There are no shell scripts and no pre-steps: stage the reads and run an arm.
 
 
-Run shape: `nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf -entry illumina -profile cluster --tier hot`.
+Run shape: `nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf --arm illumina -profile cluster --tier hot`.
 No clone: the pipeline is pulled from GitHub, and `-main-script` points at the subdirectory.
 The tier is one word on the command line; the pipeline code and the params are
 shared. Every path on a tier derives from that tier's single root, set in the
@@ -62,7 +62,7 @@ does from `fastq_dir`, so they cannot drift apart either.
 
 Per-platform *workflows* (rather than one branching on platform) keep each arm bare-bones —
 the three tool chains have nothing in common, so a merged one would be all `if`. They live
-in one file because they share the includes and the config; `-entry` picks one per run.
+in one file because they share the includes and the config; `--arm` picks one per run.
 They are not run concurrently: see Phase 4.
 
 ## Module reuse
@@ -93,7 +93,7 @@ Two things to know before wiring these up:
   `basecalling` rather than `ont`. Conversely, at their pinned releases bwa, samtools,
   minimap2 and parabricks declare no `publishDir` at all, so the output layout is set in
   `nextflow.config` — which is also what lets every arm publish its BAM to one
-  `alignment/` folder for `-entry compare` to find.
+  `alignment/` folder for `--arm compare` to find.
 - **`minimap2`/`parabricks`/`dorado` have no `conf/module.config`** in the repos that use
   them; those pipelines pin the image inline in `nextflow.config`. Do the same here rather
   than inventing module configs.
@@ -122,7 +122,7 @@ one of the checks `verify` performs, because it reads both tiers in a single run
 and can compare them directly. That removes the manifest files, their naming, and
 the risk of comparing a stale one.
 
-## Phase 2 — `-entry verify`: integrity and raw throughput, no tools
+## Phase 2 — `--arm verify`: integrity and raw throughput, no tools
 
 A single-process pipeline that isolates the filesystem from every tool confound.
 
@@ -198,7 +198,7 @@ This is where an IO benchmark usually goes wrong. Controls:
 
 Instrumentation is on by default in `nextflow.config`: every run writes a trace, an HTML
 report and a timeline into `params.results`, named `<kind>-<tier>-rep<N>-<timestamp>`. The
-tier and rep in the filename are how `-entry report` knows what a trace was, so no
+tier and rep in the filename are how `--arm report` knows what a trace was, so no
 bookkeeping file is needed. The trace gives per-task `realtime`, `%cpu`, `rchar`/`wchar`, `read_bytes`/`write_bytes`,
 `syscr`/`syscw` — enough to compute effective MB/s per process and to tell "slow because
 IO" from "slow because it waited". It is written with `raw = true`, so durations are plain
@@ -207,12 +207,12 @@ of parsing `"2m 30s"` and `"1.2 GB"` back into numbers.
 
 ## Phase 5 — output integrity and reporting
 
-- `-entry compare` — for each sample, compare the hot and cold BAM by **body**
+- `--arm compare` — for each sample, compare the hot and cold BAM by **body**
   (`samtools view <bam> | md5sum`), not by file md5: the `@PG` header records the command
   line, which contains tier-specific paths and will always differ. Plus a `flagstat` diff
   as a human-readable cross-check. Identical bodies across tiers is the strong statement
   that cold reads are trustworthy under real load.
-- `-entry report` — all trace files → one tidy CSV
+- `--arm report` — all trace files → one tidy CSV
   (`run_id,workload,tier,device,rep,run_ok,process,sample,realtime_s,cpu_pct,read_mb,write_mb,read_mb_per_s`),
   with the tier and rep taken from each trace's filename, so one row is one task with its
   run identity attached.
