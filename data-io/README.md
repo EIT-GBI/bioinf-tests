@@ -117,6 +117,11 @@ set up — as long as it carries the `repo` scope. A **fine-grained** PAT must
 list all four repositories (`bioinf-tests`, `nf-mod-minimap2`, `nf-mod-dorado`,
 `nf-mod-utils`) or the main clone succeeds and the submodule fetch fails.
 
+> **If a run dies with `Repository may be corrupted`**, two `nextflow run`
+> commands raced to update the cached clone. Delete
+> `~/.nextflow/assets/EIT-GBI/bioinf-tests`, run `nextflow pull
+> EIT-GBI/bioinf-tests` once, and keep `-latest` out of concurrent commands.
+
 > **If the submodules come back empty** (an include fails on a missing
 > `modules/...` path), the cause is the repo-root `nextflow.config`, which
 > exists solely to carry `manifest.recurseSubmodules = true`. Nextflow reads
@@ -224,19 +229,39 @@ sbatch -J nf-io -p cpu -t 7-00:00:00 --wrap="
 
 ### Running the four arms in parallel
 
-The arms write to separate directories and traces, so they can be launched
-together. Add `&` and a `wait`, and give the driver job enough memory for four
-JVMs:
+Three things have to be right, or parallel runs collide:
+
+0. **Pull once, up front, and drop `-latest` from the parallel commands.** Four
+   concurrent runs each trying to update the same `~/.nextflow/assets` clone
+   race on it, and you get
+   `Unknown error accessing project ... Repository may be corrupted`.
+1. **Each run needs its own launch directory.** Nextflow keeps its session
+   cache in `.nextflow/` under the launch dir, and `-resume` resumes *the last
+   session in that directory* — so four concurrent runs sharing one directory
+   all try to resume the same session and three of them die with
+   `Unable to acquire lock on session with ID ...`.
+2. **`--results` must be an absolute path**, so the traces still collect in one
+   place for `--arm report` despite the separate launch directories.
 
 ```bash
+cd /mnt/lustre/projects/bioinformatics/runs
+RESULTS=$PWD/results
+
+# once, before the parallel block - not inside it
+nextflow pull EIT-GBI/bioinf-tests
+
+# note: no -latest here, since the pull above already updated the cached copy
+NF="nextflow run EIT-GBI/bioinf-tests -main-script data-io/main.nf \
+      -profile cluster -resume --results $RESULTS"
+
 sbatch -J nf-io -p cpu -t 3-00:00:00 --mem=16G --wrap="
   $NF --arm verify
   for rep in 1 2 3; do
     for tier in hot cold; do
-      $NF --arm illumina --tier \$tier --rep \$rep                &
-      $NF --arm pacbio   --tier \$tier --rep \$rep --device cpu   &
-      $NF --arm pacbio   --tier \$tier --rep \$rep --device gpu   &
-      $NF --arm ont      --tier \$tier --rep \$rep                &
+      (mkdir -p par/illumina   && cd par/illumina   && $NF --arm illumina --tier \$tier --rep \$rep) &
+      (mkdir -p par/pacbio-cpu && cd par/pacbio-cpu && $NF --arm pacbio --device cpu --tier \$tier --rep \$rep) &
+      (mkdir -p par/pacbio-gpu && cd par/pacbio-gpu && $NF --arm pacbio --device gpu --tier \$tier --rep \$rep) &
+      (mkdir -p par/ont        && cd par/ont        && $NF --arm ont --tier \$tier --rep \$rep) &
       wait
     done
   done
@@ -244,6 +269,8 @@ sbatch -J nf-io -p cpu -t 3-00:00:00 --mem=16G --wrap="
   $NF --arm report
 "
 ```
+
+`--mem=16G` because the driver job now runs four JVMs rather than one.
 
 **What it costs you.** Tiers stay serial, so hot and cold still see the same
 *set* of workloads — but not the same *timing*, because the arms finish at
