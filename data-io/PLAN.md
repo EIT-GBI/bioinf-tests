@@ -52,7 +52,8 @@ data-io/
 There are no shell scripts and no pre-steps: stage the reads and run an arm.
 
 
-Run shape: `nextflow run main.nf -entry illumina -profile cluster --tier hot`.
+Run shape: `nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf -entry illumina -profile cluster --tier hot`.
+No clone: the pipeline is pulled from GitHub, and `-main-script` points at the subdirectory.
 The tier is one word on the command line; the pipeline code and the params are
 shared. Every path on a tier derives from that tier's single root, set in the
 `hot`/`cold` profile, so there is one place to change and nothing to keep in

@@ -52,9 +52,10 @@ def readSamplesheet(samplesheet_ch) {
         .filter { row -> row.sample && !row.sample.startsWith('#') }
 }
 
-// Where a tier keeps its inputs and its published results
-def inputDir(tier)  { "${tier == 'cold' ? params.cold_root : params.hot_root}/${params.test_subdir}/input"  }
-def outputDir(tier) { "${tier == 'cold' ? params.cold_root : params.hot_root}/${params.test_subdir}/output" }
+// Inputs come from the tier under test; everything written lands on Lustre,
+// split by tier so `compare` can still pair the two sides. See nextflow.config.
+def inputDir(tier)  { "${tier == 'cold' ? params.cold_root : params.hot_root}/${params.test_subdir}/input" }
+def outputDir(tier) { "${params.hot_root}/${params.test_subdir}/output/${tier}" }
 
 
 // ---------------------------------------------------------------------------

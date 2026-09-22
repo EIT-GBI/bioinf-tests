@@ -35,32 +35,42 @@ results/                 traces, verify.csv, the reports (gitignored)
 Everything a tier needs is derived from one root, set in `nextflow.config`:
 
 ```
-<root>/tests/data-io/input/{illumina,pacbio,ont}/     reads you stage
-<root>/tests/data-io/output/                          published results
-<root>/tests/data-io/work/                            nextflow work dir
-<root>/references/                                    references + indexes
+READ from the tier under test:
+  <tier root>/tests/data-io/input/{illumina,pacbio,ont}/   reads you stage
+  <tier root>/references/                                  references + indexes
+
+WRITTEN to Lustre always, whichever tier is being read:
+  <lustre>/tests/data-io/work/                             nextflow work dir
+  <lustre>/tests/data-io/output/<tier>/                    published results
+  <launch dir>/results/                                    traces and reports
 ```
 
 ---
 
 ## Setup
 
+**No clone needed.** Nextflow pulls the pipeline straight from GitHub and caches
+it under `~/.nextflow/assets/`. The pipeline lives in the repo's `data-io/`
+subdirectory, so every command carries `-main-script data-io/main.nf`:
+
 ```bash
-git clone --recursive https://github.com/EIT-GBI/bioinf-tests.git
-# already cloned?
-git submodule update --init --recursive
+nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf \
+  -entry verify -profile cluster -resume
 ```
 
-> **Pulling later?** `git pull` moves this repo's *pointer* to each module but
-> not the module itself, so you can end up running old module code with no
-> error to tell you. Always follow a pull with:
->
-> ```bash
-> git submodule update --init --recursive
-> ```
+`-latest` re-pulls the newest commit on the default branch. Without it Nextflow
+silently reuses whatever it cached the first time.
 
-Then stage the reads into `<root>/tests/data-io/input/<platform>/` on both
-tiers. That is the whole setup — samplesheets are built from the folders.
+> **Launch from `/mnt/lustre/projects/bioinformatics/runs`**, not from an
+> Alluxio path. Nextflow writes `results/` (traces and reports) relative to
+> wherever you launch, and `-entry report` reads every trace it finds there —
+> so keeping every run in one launch directory is what makes the hot-vs-cold
+> table complete. It also needs normal POSIX semantics, which Alluxio may not
+> give it.
+
+The only manual step is staging the reads into
+`<root>/tests/data-io/input/<platform>/` on both tiers. Samplesheets are built
+from those folders.
 
 | Arm | Expected layout | Sample name |
 |---|---|---|
@@ -73,17 +83,22 @@ References must already be indexed **on both tiers** (`.amb .ann .bwt .pac .sa`
 for Illumina, `.fai` for all three). Index building is not part of the
 measurement and no timed arm does it.
 
----
+> **The tool modules are git submodules.** `manifest.recurseSubmodules` tells
+> Nextflow to fetch them on pull. Confirm that works on the first remote run —
+> if an include fails with a missing `modules/...` path, fall back to a
+> `git clone --recursive` and run `main.nf` by path.
 
 ## Run it on the cluster
 
 Hand the Nextflow driver to SLURM rather than running it in your terminal:
 
 ```bash
-cd /path/to/bioinf-tests/data-io
+mkdir -p /mnt/lustre/projects/bioinformatics/runs
+cd       /mnt/lustre/projects/bioinformatics/runs   # results/ lands here
 
-sbatch -J nf-io -p cpu -t 2-00:00:00 \
-  --wrap="nextflow run main.nf -entry illumina -profile cluster --tier hot --rep 1"
+sbatch -J nf-io -p cpu -t 2-00:00:00 --wrap="\
+  nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf \
+    -entry illumina -profile cluster --tier hot --rep 1 -resume"
 ```
 
 Watch it with `squeue -u $USER` and `tail -f slurm-<jobid>.out`.
@@ -96,32 +111,46 @@ Watch it with `squeue -u $USER` and `tail -f slurm-<jobid>.out`.
 | `-J nf-io` | Job **name**. This job is only the Nextflow *driver* — it submits and babysits the real work; the tools run as their own jobs. |
 | `-p cpu` | **Partition** for the driver. The driver is tiny, so `cpu` is right even for the GPU arms — Dorado and Parabricks request the `gpu` partition themselves. |
 | `-t 2-00:00:00` | Walltime. The driver lives as long as the whole run, and ONT sup basecalling takes hours. |
+| `nextflow run EIT-GBI/bioinf-tests` | Pulls the pipeline from GitHub — no clone. |
+| `-latest` | Re-pull the newest commit. Without it, Nextflow reuses its cached copy. |
+| `-main-script data-io/main.nf` | The pipeline is in a subdirectory of the repo. |
 | `-entry illumina` | Which arm of `main.nf` to run. It takes one name. |
 | `-profile cluster` | SLURM executor + Apptainer containers. |
 | `--tier hot` | Which storage tier to read. Omit and it defaults to `hot`. |
 | `--rep 1` | Repeat number. It only labels the trace file, so `-entry report` can tell reps apart. |
+| `-resume` | Reuse cached tasks after a crash instead of redoing hours of work. |
 
-> **No `-resume`, ever.** Unlike `nf-dnaseq`, a resumed run would reuse cached
-> task output and report a cache hit as a fast IO measurement.
+> **What `-resume` does to the numbers.** It is there so a driver that dies six
+> hours into an ONT run can pick up where it left off rather than redo
+> everything. A resumed task is *not* re-measured: Nextflow records it as
+> `CACHED`, and `timing_report.py` counts only `COMPLETED` tasks, so a cache hit
+> can never be reported as a fast read. The cost is a thinner sample, not a
+> wrong one — if a rep looks short on tasks in `all_tasks.csv`, it was resumed.
+> To force a genuine re-measurement, drop `-resume` or change `--rep`.
 
 ### The whole matrix in one submission
 
 One `sbatch`, everything sequential in the background:
 
 ```bash
-sbatch -J nf-io -p cpu -t 7-00:00:00 --wrap='
-  nextflow run main.nf -entry verify -profile cluster
+cd /mnt/lustre/projects/bioinformatics/runs
+
+# -resume lives in $NF, so every line below runs with it
+NF="nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf -profile cluster -resume"
+
+sbatch -J nf-io -p cpu -t 7-00:00:00 --wrap="
+  $NF -entry verify
   for rep in 1 2 3; do
     for tier in hot cold; do
-      nextflow run main.nf -entry illumina -profile cluster --tier $tier --rep $rep
-      nextflow run main.nf -entry pacbio   -profile cluster --tier $tier --rep $rep --pacbio.device cpu
-      nextflow run main.nf -entry pacbio   -profile cluster --tier $tier --rep $rep --pacbio.device gpu
-      nextflow run main.nf -entry ont      -profile cluster --tier $tier --rep $rep
+      $NF -entry illumina --tier \$tier --rep \$rep
+      $NF -entry pacbio   --tier \$tier --rep \$rep --pacbio.device cpu
+      $NF -entry pacbio   --tier \$tier --rep \$rep --pacbio.device gpu
+      $NF -entry ont      --tier \$tier --rep \$rep
     done
   done
-  nextflow run main.nf -entry compare -profile cluster
-  nextflow run main.nf -entry report  -profile cluster
-'
+  $NF -entry compare
+  $NF -entry report
+"
 ```
 
 ONT sup basecalling dominates the budget — time one rep before committing to
@@ -146,7 +175,9 @@ It reads every input on both tiers, `--verify.reps` times each, then reports:
    report`, where one tier runs at a time.
 
 ```bash
-nextflow run main.nf -entry verify -profile cluster
+nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf \
+  -entry verify -profile cluster -resume
+
 cat results/verify-report.txt
 ```
 
@@ -194,10 +225,14 @@ Then the workload arms, then `compare` and `report`.
   serves bwa", and a slowdown could not be attributed to an access pattern.
   **Within** an arm, samples fan out exactly as in a normal run, which is the
   realistic condition and is kept.
-- **The work dir lives on the tier under test**, so reads *and* writes go
-  through it and each arm is measured end to end. To isolate read performance
-  instead, point `workDir` at Lustre for both tiers in `nextflow.config` and
-  report those runs separately.
+- **Only reads vary by tier. Everything written goes to Lustre.** The work dir
+  needs POSIX semantics — atomic rename, locking, heavy small-metadata traffic —
+  and Alluxio is a cache over object storage, weak at exactly those. A cold run
+  with its work dir on Alluxio could fail or crawl for reasons unrelated to read
+  performance, and would read as "Alluxio is slow". Writing to Lustre also keeps
+  the measurement attributable to the read path, and matches how the tier is
+  actually used. The trade-off: this measures reads, not end-to-end cold — if
+  writing to Alluxio also matters, test that separately.
 - **GPU nodes may mount storage differently from CPU nodes.** A real confound
   for the Parabricks and Dorado arms. Pin the node class with `clusterOptions`
   across a comparison.
