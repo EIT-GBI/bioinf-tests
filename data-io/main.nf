@@ -5,7 +5,7 @@
 // ---------------------------------------------------------------------------
 //   nextflow run main.nf --arm verify                   # both tiers, integrity
 //   nextflow run main.nf --arm illumina --tier hot
-//   nextflow run main.nf --arm pacbio   --tier cold --pacbio.device gpu
+//   nextflow run main.nf --arm pacbio   --tier cold --device gpu
 //   nextflow run main.nf --arm ont      --tier hot
 //   nextflow run main.nf --arm compare                  # hot vs cold outputs
 //   nextflow run main.nf --arm report                   # timing table
@@ -79,7 +79,7 @@ workflow {
         |
         |  --arm verify     both tiers, integrity + throughput      (no --tier)
         |  --arm illumina   bwa mem                                 --tier hot|cold
-        |  --arm pacbio     minimap2, or Parabricks with --pacbio.device gpu
+        |  --arm pacbio     minimap2, or Parabricks with --device gpu
         |  --arm ont        dorado sup basecalling + aligner        --tier hot|cold
         |  --arm compare    hot vs cold BAM bodies                  (no --tier)
         |  --arm report     timing table across every run so far    (no --tier)
@@ -103,7 +103,7 @@ workflow {
 // ---------------------------------------------------------------------------
 // This is where the "Alluxio gave corrupted files" question gets answered, and
 // it runs in minutes rather than hours. Every input file on BOTH tiers is read
-// end to end, checksummed and timed, params.verify.reps times over.
+// end to end, checksummed and timed, params.reps times over.
 //
 // Reading both tiers in one run is what removes the old manifest dance: the
 // cross-rep and hot-vs-cold comparisons both happen in VERIFY_REPORT, with no
@@ -139,9 +139,9 @@ workflow verify {
     // Strings (25.x coerced them to Integer), and Groovy's `1..'2'` builds a
     // range to the character's code point - so --verify.reps 2 would quietly
     // run 50 reps against both tiers instead of 2.
-    def reps = params.verify.reps as int
+    def reps = params.reps as int
     if (reps < 1) {
-        error "params.verify.reps must be at least 1, got '${params.verify.reps}'"
+        error "--reps must be at least 1, got '${params.reps}'"
     }
 
     // One task per (tier, file, rep). `rep` rides in meta, which is a val
@@ -232,11 +232,11 @@ workflow illumina {
 // stays in the timed pipeline as its own process rather than a prep step.
 workflow pacbio {
 
-    if (!(params.pacbio.device in ['cpu', 'gpu'])) {
-        error "Invalid params.pacbio.device: ${params.pacbio.device}. Use 'cpu' (minimap2) or 'gpu' (Parabricks)."
+    if (!(params.device in ['cpu', 'gpu'])) {
+        error "Invalid --device '${params.device}'. Use 'cpu' (minimap2) or 'gpu' (Parabricks)."
     }
-    if (!(params.pacbio.input_type in ['ubam', 'fastq'])) {
-        error "Invalid params.pacbio.input_type: ${params.pacbio.input_type}. Use 'ubam' or 'fastq'."
+    if (!(params.input_type in ['ubam', 'fastq'])) {
+        error "Invalid --input_type '${params.input_type}'. Use 'ubam' or 'fastq'."
     }
 
     if (params.samplesheet) {
@@ -264,7 +264,7 @@ workflow pacbio {
             tuple(meta, file(row.reads, checkIfExists: true))
         }
 
-    if (params.pacbio.input_type == 'ubam') {
+    if (params.input_type == 'ubam') {
         SAMTOOLS_FASTQ(reads_ch)
         fastq_ch = SAMTOOLS_FASTQ.out.reads
     }
@@ -277,7 +277,7 @@ workflow pacbio {
         fasta: faidxFor(meta)
     }
 
-    if (params.pacbio.device == 'gpu') {
+    if (params.device == 'gpu') {
         PARABRICKS_MINIMAP2(aln_in.reads, aln_in.fasta)
         bam_ch = PARABRICKS_MINIMAP2.out.bam     // tuple(meta, bam, bai)
     }

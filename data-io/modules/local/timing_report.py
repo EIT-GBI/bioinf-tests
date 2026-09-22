@@ -33,7 +33,7 @@ def num(v):
 traces = sorted(glob.glob("trace-*.txt"))
 tasks = []
 for path in traces:
-    m = re.match(r"trace-(\w+)-(hot|cold)-rep(\d+)-", os.path.basename(path))
+    m = re.match(r"trace-([\w-]+?)-(hot|cold)-rep(\d+)-", os.path.basename(path))
     if not m:
         continue
     arm, tier, rep = m.group(1), m.group(2), m.group(3)

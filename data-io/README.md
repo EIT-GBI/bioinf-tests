@@ -180,7 +180,14 @@ Watch it with `squeue -u $USER` and `tail -f slurm-<jobid>.out`.
 | `-profile cluster` | SLURM executor + Apptainer containers. |
 | `--tier hot` | Which storage tier to read. Omit and it defaults to `hot`. |
 | `--rep 1` | Repeat number. It only labels the trace file, so `--arm report` can tell reps apart. |
+| `--device gpu` | pacbio only: Parabricks instead of minimap2. Top-level, not `--pacbio.device` — see below. |
 | `-resume` | Reuse cached tasks after a crash instead of redoing hours of work. |
+
+> **Params are top level on purpose.** A nested `--pacbio.device gpu` does not
+> reach values `nextflow.config` derives from it (a top-level `--tier` does),
+> so the run label would silently keep saying `cpu` and the GPU run would
+> overwrite the CPU run's outputs and trace. Hence `--device`, `--input_type`
+> and `--reps` rather than `--pacbio.*` and `--verify.*`.
 
 > **What `-resume` does to the numbers.** It is there so a driver that dies six
 > hours into an ONT run can pick up where it left off rather than redo
@@ -200,13 +207,13 @@ cd /mnt/lustre/projects/bioinformatics/runs
 # -resume lives in $NF, so every line below runs with it
 NF="nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf -profile cluster -resume"
 
-sbatch -J nf-io -p cpu -t 4-00:00:00 --wrap="
+sbatch -J nf-io -p cpu -t 7-00:00:00 --wrap="
   $NF --arm verify
   for rep in 1 2 3; do
     for tier in hot cold; do
       $NF --arm illumina --tier \$tier --rep \$rep
-      $NF --arm pacbio   --tier \$tier --rep \$rep --pacbio.device cpu
-      $NF --arm pacbio   --tier \$tier --rep \$rep --pacbio.device gpu
+      $NF --arm pacbio   --tier \$tier --rep \$rep --device cpu
+      $NF --arm pacbio   --tier \$tier --rep \$rep --device gpu
       $NF --arm ont      --tier \$tier --rep \$rep
     done
   done
@@ -214,6 +221,45 @@ sbatch -J nf-io -p cpu -t 4-00:00:00 --wrap="
   $NF --arm report
 "
 ```
+
+### Running the four arms in parallel
+
+The arms write to separate directories and traces, so they can be launched
+together. Add `&` and a `wait`, and give the driver job enough memory for four
+JVMs:
+
+```bash
+sbatch -J nf-io -p cpu -t 3-00:00:00 --mem=16G --wrap="
+  $NF --arm verify
+  for rep in 1 2 3; do
+    for tier in hot cold; do
+      $NF --arm illumina --tier \$tier --rep \$rep                &
+      $NF --arm pacbio   --tier \$tier --rep \$rep --device cpu   &
+      $NF --arm pacbio   --tier \$tier --rep \$rep --device gpu   &
+      $NF --arm ont      --tier \$tier --rep \$rep                &
+      wait
+    done
+  done
+  $NF --arm compare
+  $NF --arm report
+"
+```
+
+**What it costs you.** Tiers stay serial, so hot and cold still see the same
+*set* of workloads — but not the same *timing*, because the arms finish at
+different points and the overlap window differs between the two tiers. Two
+consequences:
+
+- A slowdown can no longer be attributed to an access pattern. If cold is
+  slower with bwa, minimap2 and dorado all reading at once, you cannot tell
+  which pattern suffered.
+- If the four together saturate the link, every number becomes a share of a
+  saturated link rather than a measurement of that workload.
+
+In practice the GPU arms often serialise anyway, since `pacbio --device gpu`
+and `ont` both queue for GPUs. The wall-clock saving is large and ONT dominates
+the budget, so this is a reasonable trade — but if a ratio comes out marginal,
+re-run that cell serially before believing it.
 
 ONT sup basecalling dominates the budget — time one rep before committing to
 three.
@@ -223,7 +269,7 @@ three.
 ## The order that matters
 
 **`verify` first.** It runs in minutes and can invalidate everything after it.
-It reads every input on both tiers, `--verify.reps` times each, then reports:
+It reads every input on both tiers, `--reps` times each, then reports:
 
 1. **Cross-rep disagreement** — one file read twice giving two different md5s.
    The bytes on disk cannot have changed, so the read path returned something
