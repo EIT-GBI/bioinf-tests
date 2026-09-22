@@ -128,8 +128,9 @@ process VERIFY_READ {
     #!/usr/bin/env bash
     set -uo pipefail
 
-    # GNU stat first, BSD stat as a fallback. `wc -c` is not an option: it would
-    # read the whole file and double the very thing being timed.
+    # Size comes from the inode, not from reading: stat() is two syscalls and
+    # touches no data, so it stays outside the timed window below.
+    # GNU stat first, BSD stat as a fallback.
     bytes=\$(stat -Lc %s "${f}" 2>/dev/null || stat -Lf %z "${f}" 2>/dev/null || echo 0)
 
     case "${f}" in
@@ -138,11 +139,23 @@ process VERIFY_READ {
         *)            check=none ;;
     esac
 
+    # THE READ. md5sum is the only thing inside the timing window, and it is
+    # what streams the file end to end: ${f} is the symlink Nextflow staged
+    # into the work dir, so the bytes come off the tier under test rather than
+    # a local copy. Checksumming doubles as the integrity check, which is why
+    # it is preferred over `dd ... of=/dev/null` - one pass, two answers.
+    #
+    # Caveat: md5 itself runs at roughly 700-800 MB/s per core, so on a
+    # filesystem faster than that this measures the hash, not the storage.
+    # Under normal fan-out each task's share is usually well below that
+    # ceiling, but treat a single-stream figure near ~750 MB/s with suspicion.
     start=\$(date +%s.%N)
     md5=\$(md5sum "${f}" | awk '{print \$1}')
     rc=\$?
     end=\$(date +%s.%N)
 
+    # Deliberately after the timing window: these read the file a second time,
+    # and would otherwise be counted as part of the storage read.
     case "\$check" in
         samtools_quickcheck) samtools quickcheck "${f}" && ok=yes || ok=no ;;
         gzip_t)              gzip -t "${f}"             && ok=yes || ok=no ;;

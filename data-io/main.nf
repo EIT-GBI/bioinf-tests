@@ -135,12 +135,21 @@ workflow verify {
     // tuple(tier, path relative to that tier's input dir, file)
     files_ch = channel.fromList(files)
 
+    // `as int` is not decoration. Nextflow 26 hands command-line params over as
+    // Strings (25.x coerced them to Integer), and Groovy's `1..'2'` builds a
+    // range to the character's code point - so --verify.reps 2 would quietly
+    // run 50 reps against both tiers instead of 2.
+    def reps = params.verify.reps as int
+    if (reps < 1) {
+        error "params.verify.reps must be at least 1, got '${params.verify.reps}'"
+    }
+
     // One task per (tier, file, rep). `rep` rides in meta, which is a val
     // input, so each rep hashes differently and genuinely re-reads the file
     // rather than being collapsed into one task.
     VERIFY_READ(
         files_ch
-            .combine(channel.of(1..params.verify.reps))
+            .combine(channel.of(1..reps))
             .map { tier, rel, f, rep -> tuple([tier: tier, rel: rel, rep: rep], f) }
     )
 
