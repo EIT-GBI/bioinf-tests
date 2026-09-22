@@ -49,30 +49,35 @@ WRITTEN to Lustre always, whichever tier is being read:
 
 ## Setup
 
-The pipeline is run from **one shared checkout on Lustre**, not pulled from
-GitHub per user. Clone it once:
+The pipeline is run from a **checkout on shared storage**, not pulled from
+GitHub on every run. Clone it once:
 
 ```bash
-git clone --recursive https://github.com/EIT-GBI/bioinf-tests.git \
-  /mnt/lustre/projects/bioinformatics/src/bioinf-tests
+git clone --recursive git@github.com:EIT-GBI/bioinf-tests.git \
+  /mnt/gbi-shared/home/cristian-soitu/code/nf/bioinf-tests
 ```
 
+The SSH URL avoids tokens entirely, for the clone and for the private
+submodules. Check you have a key registered with `ssh -T git@github.com` first;
+if not, use the HTTPS URL and give a personal access token (with `repo` scope)
+at the password prompt — GitHub has not accepted account passwords over HTTPS
+since 2021.
+
 `--recursive` matters: the tool modules are git submodules, and three of them
-are private. That clone is the only step that needs GitHub credentials — use a
-personal access token with `repo` scope, or your SSH key. Nothing afterwards
-needs them.
+are private. This clone is the only step that touches GitHub at all — nothing
+afterwards needs credentials or network.
 
 Run it by pointing at `data-io/main.nf` inside the clone:
 
 ```bash
-nextflow run /mnt/lustre/projects/bioinformatics/src/bioinf-tests/data-io/main.nf \
+nextflow run /mnt/gbi-shared/home/cristian-soitu/code/nf/bioinf-tests/data-io/main.nf \
   --arm verify -profile cluster -resume
 ```
 
 To update, `git pull` in that one directory:
 
 ```bash
-cd /mnt/lustre/projects/bioinformatics/src/bioinf-tests && git pull --recurse-submodules
+cd /mnt/gbi-shared/home/cristian-soitu/code/nf/bioinf-tests && git pull --recurse-submodules
 ```
 
 > **Why not `nextflow run EIT-GBI/bioinf-tests -latest`?** That form works, but
@@ -116,7 +121,7 @@ Hand the Nextflow driver to SLURM rather than running it in your terminal:
 mkdir -p /mnt/lustre/projects/bioinformatics/runs
 cd       /mnt/lustre/projects/bioinformatics/runs   # results/ lands here
 
-PIPELINE=/mnt/lustre/projects/bioinformatics/src/bioinf-tests/data-io/main.nf
+PIPELINE=/mnt/gbi-shared/home/cristian-soitu/code/nf/bioinf-tests/data-io/main.nf
 
 sbatch -J nf-io -p cpu -t 2-00:00:00 --wrap="\
   nextflow run $PIPELINE --arm illumina -profile cluster --tier hot --rep 1 -resume"
@@ -161,11 +166,11 @@ One `sbatch`, everything sequential in the background:
 ```bash
 cd /mnt/lustre/projects/bioinformatics/runs
 
-PIPELINE=/mnt/lustre/projects/bioinformatics/src/bioinf-tests/data-io/main.nf
+PIPELINE=/mnt/gbi-shared/home/cristian-soitu/code/nf/bioinf-tests/data-io/main.nf
 # -resume lives in $NF, so every line below runs with it
 NF="nextflow run $PIPELINE -profile cluster -resume"
 
-sbatch -J nf-io -p cpu -t 7-00:00:00 --wrap="
+sbatch -J nf-io -p cpu -t 4-00:00:00 --wrap="
   $NF --arm verify
   for rep in 1 2 3; do
     for tier in hot cold; do
@@ -195,7 +200,7 @@ place for `--arm report` despite the separate launch directories.
 cd /mnt/lustre/projects/bioinformatics/runs
 RESULTS=$PWD/results
 
-PIPELINE=/mnt/lustre/projects/bioinformatics/src/bioinf-tests/data-io/main.nf
+PIPELINE=/mnt/gbi-shared/home/cristian-soitu/code/nf/bioinf-tests/data-io/main.nf
 NF="nextflow run $PIPELINE -profile cluster -resume --results $RESULTS"
 
 sbatch -J nf-io -p cpu -t 3-00:00:00 --mem=16G --wrap="
@@ -311,6 +316,12 @@ Then the workload arms, then `compare` and `report`.
   the measurement attributable to the read path, and matches how the tier is
   actually used. The trade-off: this measures reads, not end-to-end cold — if
   writing to Alluxio also matters, test that separately.
+- **Published files are hard links, not copies** (`--publish_mode`). Java 21+
+  copies with `copy_file_range`, which Lustre answers with `ENODATA` — the task
+  succeeds and then the run dies with `Failed to publish file ... No data
+  available`. A hard link avoids the syscall, but requires the work dir and the
+  destination on the same filesystem. Both are on Lustre by default. If you
+  ever publish across filesystems, pass `--publish_mode copy`.
 - **GPU nodes may mount storage differently from CPU nodes.** A real confound
   for the Parabricks and Dorado arms. Pin the node class with `clusterOptions`
   across a comparison.

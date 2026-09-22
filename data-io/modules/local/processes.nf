@@ -19,7 +19,7 @@
 // Paired-end FASTQ: <sample>_R1.fastq.gz / <sample>_R2.fastq.gz
 process PREPARE_SAMPLESHEET_ILLUMINA {
     tag "${input_dir}"
-    publishDir "${params.outdir}/samplesheet", mode: 'copy'
+    publishDir "${params.outdir}/samplesheet", mode: params.publish_mode
 
     input:
     path pyscript
@@ -38,7 +38,7 @@ process PREPARE_SAMPLESHEET_ILLUMINA {
 // Long reads, one file per sample: FASTQ or unaligned BAM (PacBio HiFi)
 process PREPARE_SAMPLESHEET_PACBIO {
     tag "${input_dir}"
-    publishDir "${params.outdir}/samplesheet", mode: 'copy'
+    publishDir "${params.outdir}/samplesheet", mode: params.publish_mode
 
     input:
     path pyscript
@@ -64,7 +64,7 @@ process PREPARE_SAMPLESHEET_PACBIO {
 // Subdirectories win when both are present.
 process PREPARE_SAMPLESHEET_ONT {
     tag "${input_dir}"
-    publishDir "${params.outdir}/samplesheet", mode: 'copy'
+    publishDir "${params.outdir}/samplesheet", mode: params.publish_mode
 
     input:
     path input_dir
@@ -182,7 +182,7 @@ process VERIFY_READ {
 // embedded python: a `"""` docstring closes the script block, and the block's
 // indentation stripping is easy to break.
 process VERIFY_REPORT {
-    publishDir params.results, mode: 'copy'
+    publishDir params.results, mode: params.publish_mode
 
     input:
     path pyscript
@@ -242,7 +242,7 @@ process COMPARE_BAM {
 // Reads the trace files staged from params.results. The tier and rep come from
 // each filename, so no bookkeeping file is needed to know what a trace was.
 process TIMING_REPORT {
-    publishDir params.results, mode: 'copy'
+    publishDir params.results, mode: params.publish_mode
 
     input:
     path pyscript
