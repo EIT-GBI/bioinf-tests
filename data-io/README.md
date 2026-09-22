@@ -49,98 +49,51 @@ WRITTEN to Lustre always, whichever tier is being read:
 
 ## Setup
 
-**No clone needed.** Nextflow pulls the pipeline straight from GitHub and caches
-it under `~/.nextflow/assets/`. The pipeline lives in the repo's `data-io/`
-subdirectory, so every command carries `-main-script data-io/main.nf`:
+The pipeline is run from **one shared checkout on Lustre**, not pulled from
+GitHub per user. Clone it once:
 
 ```bash
-nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf \
+git clone --recursive https://github.com/EIT-GBI/bioinf-tests.git \
+  /mnt/lustre/projects/bioinformatics/src/bioinf-tests
+```
+
+`--recursive` matters: the tool modules are git submodules, and three of them
+are private. That clone is the only step that needs GitHub credentials — use a
+personal access token with `repo` scope, or your SSH key. Nothing afterwards
+needs them.
+
+Run it by pointing at `data-io/main.nf` inside the clone:
+
+```bash
+nextflow run /mnt/lustre/projects/bioinformatics/src/bioinf-tests/data-io/main.nf \
   --arm verify -profile cluster -resume
 ```
 
-`-latest` re-pulls the newest commit on the default branch. Without it Nextflow
-silently reuses whatever it cached the first time.
-
-> **Why `--arm` and not `-entry`.** Nextflow 26's strict syntax removed
-> `-entry` and tells you to "use a param to run a named workflow from the entry
-> workflow", which is what `main.nf` does. The same command therefore works on
-> 25.x and 26.x. That strict parser also rejects `def` at the top level of a
-> config or script, so neither file uses one.
-
-### One-time: GitHub access on the cluster
-
-This repo and three of its tool modules (`nf-mod-minimap2`, `nf-mod-dorado`,
-`nf-mod-utils`) are **private**. Nextflow reaches GitHub through its own API
-client and ignores `gh auth`, git's credential helper and SSH keys, so without
-credentials it reports:
-
-```
-Remote resource not found: https://api.github.com/repos/EIT-GBI/bioinf-tests/contents/data-io/main.nf
-```
-
-That is a 404 standing in for "no access" — GitHub hides private repos from
-unauthenticated callers rather than returning 403. Give Nextflow a token
-**without writing one into a file**:
+To update, `git pull` in that one directory:
 
 ```bash
-# ~/.nextflow/scm  — no secret in here, just your username and an env var name
-providers {
-    github {
-        user     = 'cristian-soitu'
-        password = System.getenv('GITHUB_TOKEN')
-    }
-}
+cd /mnt/lustre/projects/bioinformatics/src/bioinf-tests && git pull --recurse-submodules
 ```
 
-```bash
-chmod 600 ~/.nextflow/scm
-```
+> **Why not `nextflow run EIT-GBI/bioinf-tests -latest`?** That form works, but
+> on a private repo it needs GitHub credentials on every node and in every
+> shell, and it keeps its own copy under `~/.nextflow/assets`. That copy can go
+> stale silently — a `nextflow pull` that fails on auth leaves the old code in
+> place and the next run uses it without complaint — and concurrent runs racing
+> to update it produce `Repository may be corrupted`. A shared checkout has
+> none of those failure modes, and `git pull` is a change you can see. If you
+> do use the GitHub form, add `-main-script data-io/main.nf`, since the
+> pipeline lives in a subdirectory, and check the `revision:` line in the
+> launch banner is the commit you expect.
 
-Mint a **classic** token with `repo` scope at
-<https://github.com/settings/tokens>, then put it in your environment — typed,
-not written down:
+> **Launch from `/mnt/lustre/projects/bioinformatics/runs`**, not from an
+> Alluxio path and not from inside the clone. Nextflow writes `results/`
+> (traces and reports) relative to wherever you launch, and `--arm report`
+> reads every trace it finds there — so keeping every run in one launch
+> directory is what makes the hot-vs-cold table complete. It also needs normal
+> POSIX semantics, which Alluxio may not give it.
 
-```bash
-read -rsp 'GitHub token: ' GITHUB_TOKEN && export GITHUB_TOKEN && echo
-```
-
-`read` does not reach your shell history, and the token lives only in that
-session. `sbatch` exports your environment by default, so a job submitted from
-that shell inherits it — including a week-long matrix run, since the value is
-captured at submit time. A new login means entering it again.
-
-(`gh auth token` is the shortcut if the GitHub CLI happens to be installed, but
-it is not on the cluster and is not worth installing for this.)
-
-The same token covers the private submodules, so there is nothing further to
-set up — as long as it carries the `repo` scope. A **fine-grained** PAT must
-list all four repositories (`bioinf-tests`, `nf-mod-minimap2`, `nf-mod-dorado`,
-`nf-mod-utils`) or the main clone succeeds and the submodule fetch fails.
-
-> **If a run dies with `Repository may be corrupted`**, two `nextflow run`
-> commands raced to update the cached clone. Delete
-> `~/.nextflow/assets/EIT-GBI/bioinf-tests`, run `nextflow pull
-> EIT-GBI/bioinf-tests` once, and keep `-latest` out of concurrent commands.
-
-> **If the submodules come back empty** (an include fails on a missing
-> `modules/...` path), the cause is the repo-root `nextflow.config`, which
-> exists solely to carry `manifest.recurseSubmodules = true`. Nextflow reads
-> only the root manifest when cloning, so that flag cannot live in
-> `data-io/nextflow.config`.
-
-**Alternative, if you would rather not hand Nextflow a token at all:** clone
-once to a shared location and run it by path. `-main-script` works the same way,
-and `-latest` becomes a `git pull` in that directory.
-
-```bash
-git clone --recursive git@github.com:EIT-GBI/bioinf-tests.git \
-  /mnt/lustre/projects/bioinformatics/src/bioinf-tests
-
-nextflow run /mnt/lustre/projects/bioinformatics/src/bioinf-tests \
-  -main-script data-io/main.nf --arm verify -profile cluster -resume
-```
-
-The only manual step is staging the reads into
+The only other manual step is staging the reads into
 `<root>/tests/data-io/input/<platform>/` on both tiers. Samplesheets are built
 from those folders.
 
@@ -163,9 +116,10 @@ Hand the Nextflow driver to SLURM rather than running it in your terminal:
 mkdir -p /mnt/lustre/projects/bioinformatics/runs
 cd       /mnt/lustre/projects/bioinformatics/runs   # results/ lands here
 
+PIPELINE=/mnt/lustre/projects/bioinformatics/src/bioinf-tests/data-io/main.nf
+
 sbatch -J nf-io -p cpu -t 2-00:00:00 --wrap="\
-  nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf \
-    --arm illumina -profile cluster --tier hot --rep 1 -resume"
+  nextflow run $PIPELINE --arm illumina -profile cluster --tier hot --rep 1 -resume"
 ```
 
 Watch it with `squeue -u $USER` and `tail -f slurm-<jobid>.out`.
@@ -178,9 +132,7 @@ Watch it with `squeue -u $USER` and `tail -f slurm-<jobid>.out`.
 | `-J nf-io` | Job **name**. This job is only the Nextflow *driver* — it submits and babysits the real work; the tools run as their own jobs. |
 | `-p cpu` | **Partition** for the driver. The driver is tiny, so `cpu` is right even for the GPU arms — Dorado and Parabricks request the `gpu` partition themselves. |
 | `-t 2-00:00:00` | Walltime. The driver lives as long as the whole run, and ONT sup basecalling takes hours. |
-| `nextflow run EIT-GBI/bioinf-tests` | Pulls the pipeline from GitHub — no clone. |
-| `-latest` | Re-pull the newest commit. Without it, Nextflow reuses its cached copy. |
-| `-main-script data-io/main.nf` | The pipeline is in a subdirectory of the repo. |
+| `nextflow run $PIPELINE` | The shared checkout on Lustre — no credentials, no cached copy to go stale. |
 | `--arm illumina` | Which arm of `main.nf` to run. One per run. |
 | `-profile cluster` | SLURM executor + Apptainer containers. |
 | `--tier hot` | Which storage tier to read. Omit and it defaults to `hot`. |
@@ -209,8 +161,9 @@ One `sbatch`, everything sequential in the background:
 ```bash
 cd /mnt/lustre/projects/bioinformatics/runs
 
+PIPELINE=/mnt/lustre/projects/bioinformatics/src/bioinf-tests/data-io/main.nf
 # -resume lives in $NF, so every line below runs with it
-NF="nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf -profile cluster -resume"
+NF="nextflow run $PIPELINE -profile cluster -resume"
 
 sbatch -J nf-io -p cpu -t 7-00:00:00 --wrap="
   $NF --arm verify
@@ -229,30 +182,21 @@ sbatch -J nf-io -p cpu -t 7-00:00:00 --wrap="
 
 ### Running the four arms in parallel
 
-Three things have to be right, or parallel runs collide:
+One thing has to be right, or parallel runs collide: **each run needs its own
+launch directory.** Nextflow keeps its session cache in `.nextflow/` under the
+launch dir, and `-resume` resumes *the last session in that directory* — so
+four concurrent runs sharing one directory all try to resume the same session
+and three die with `Unable to acquire lock on session with ID ...`.
 
-0. **Pull once, up front, and drop `-latest` from the parallel commands.** Four
-   concurrent runs each trying to update the same `~/.nextflow/assets` clone
-   race on it, and you get
-   `Unknown error accessing project ... Repository may be corrupted`.
-1. **Each run needs its own launch directory.** Nextflow keeps its session
-   cache in `.nextflow/` under the launch dir, and `-resume` resumes *the last
-   session in that directory* — so four concurrent runs sharing one directory
-   all try to resume the same session and three of them die with
-   `Unable to acquire lock on session with ID ...`.
-2. **`--results` must be an absolute path**, so the traces still collect in one
-   place for `--arm report` despite the separate launch directories.
+`--results` is therefore an absolute path, so the traces still collect in one
+place for `--arm report` despite the separate launch directories.
 
 ```bash
 cd /mnt/lustre/projects/bioinformatics/runs
 RESULTS=$PWD/results
 
-# once, before the parallel block - not inside it
-nextflow pull EIT-GBI/bioinf-tests
-
-# note: no -latest here, since the pull above already updated the cached copy
-NF="nextflow run EIT-GBI/bioinf-tests -main-script data-io/main.nf \
-      -profile cluster -resume --results $RESULTS"
+PIPELINE=/mnt/lustre/projects/bioinformatics/src/bioinf-tests/data-io/main.nf
+NF="nextflow run $PIPELINE -profile cluster -resume --results $RESULTS"
 
 sbatch -J nf-io -p cpu -t 3-00:00:00 --mem=16G --wrap="
   $NF --arm verify
@@ -310,8 +254,7 @@ It reads every input on both tiers, `--reps` times each, then reports:
    report`, where one tier runs at a time.
 
 ```bash
-nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf \
-  --arm verify -profile cluster -resume
+nextflow run $PIPELINE --arm verify -profile cluster -resume
 
 cat results/verify-report.txt
 ```
