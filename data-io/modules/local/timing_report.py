@@ -15,7 +15,7 @@ import re
 import statistics
 
 # Processes that are scaffolding rather than workload
-SKIP = re.compile(r"PREPARE_SAMPLESHEET|VERIFY_|COMPARE_|TIMING_")
+SKIP = re.compile(r"PREPARE_SAMPLESHEET|VERIFY_|COMPARE_|TIMING_|BWA_INDEX|SAMTOOLS_FAIDX")
 
 FIELDS = ["arm", "tier", "rep", "process", "sample", "realtime_s", "cpu_pct",
           "read_mb", "write_mb", "read_mb_per_s"]

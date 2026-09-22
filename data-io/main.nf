@@ -39,15 +39,16 @@ include { VERIFY_READ; VERIFY_REPORT }   from './modules/local/processes.nf'
 include { COMPARE_BAM; TIMING_REPORT }   from './modules/local/processes.nf'
 
 include { BWA_MEM }             from './modules/bwa/mem/main.nf'
+include { BWA_INDEX }           from './modules/bwa/index/main.nf'
 include { MINIMAP2_ALIGN }      from './modules/minimap2/align/main.nf'
 include { PARABRICKS_MINIMAP2 } from './modules/parabricks/minimap2/main.nf'
 include { DORADO_BASECALLER }   from './modules/dorado/basecaller/main.nf'
 include { DORADO_ALIGNER }      from './modules/dorado/aligner/main.nf'
 include { SAMTOOLS_FASTQ }      from './modules/samtools/fastq/main.nf'
 include { SAMTOOLS_INDEX }      from './modules/samtools/index/main.nf'
+include { SAMTOOLS_FAIDX }      from './modules/samtools/faidx/main.nf'
 include { SAMTOOLS_FLAGSTAT }   from './modules/samtools/flagstat/main.nf'
 
-include { bwaIndexFor; faidxFor } from './modules/utils/references/references.nf'
 
 
 // Rows shared by all three workload samplesheets. A '#' row is dropped because
@@ -57,6 +58,24 @@ def readSamplesheet(samplesheet_ch) {
         .splitCsv(header: true)
         .filter { row -> row.sample && !row.sample.startsWith('#') }
 }
+
+// Resolve an arm's reference, and say something useful when it is not there.
+// The indexes are built on demand (see the arms below); the fasta itself cannot
+// be, so this is the one thing that has to exist up front.
+def requireFasta(String rel) {
+    def fasta = file("${params.reference_dir}/${rel}")
+    if (!fasta.exists()) {
+        error """
+        |Reference missing on the '${params.tier}' tier:
+        |  ${fasta}
+        |
+        |Both tiers need the reference fasta in place. Its indexes do not have
+        |to exist - they are built automatically if absent.
+        """.stripMargin()
+    }
+    return fasta
+}
+
 
 // Inputs come from the tier under test; everything written lands on Lustre,
 // split by tier so `compare` can still pair the two sides. See nextflow.config.
@@ -179,9 +198,9 @@ workflow verify {
 // read Nextflow's local copy rather than the filesystem under test - exactly
 // the thing being measured.
 //
-// The reference must already be bwa-indexed on both tiers. bwaIndexFor() uses
-// checkIfExists, so a missing index fails in seconds rather than after an hour
-// of alignment - and index building is not part of the measurement.
+// The bwa index is reused if it sits beside the fasta, and built once if not.
+// Either way the build is its own process, so it never lands inside an
+// alignment's timing.
 workflow illumina {
 
     if (params.samplesheet) {
@@ -202,15 +221,27 @@ workflow illumina {
             tuple(meta, file(row.R1, checkIfExists: true), file(row.R2, checkIfExists: true))
         }
 
-    aln_in = reads_ch.multiMap { meta, r1, r2 ->
-        reads: tuple(meta, r1, r2)
-        index: bwaIndexFor(meta)
+    // Reuse the bwa index sitting next to the fasta, or build it once. Built
+    // on demand it lives in the work dir rather than on the tier, so its reads
+    // come off Lustre either way - negligible here, where the index is a few MB
+    // against multi-GB read files, but pre-build it on both tiers if you ever
+    // point this at a genome large enough for index reads to matter.
+    def fasta    = requireFasta(params.references.illumina)
+    def bwa_exts = ['amb', 'ann', 'bwt', 'pac', 'sa']
+
+    if (bwa_exts.every { ext -> file("${fasta}.${ext}").exists() }) {
+        index_ch = channel.value(tuple(fasta, bwa_exts.collect { ext -> file("${fasta}.${ext}") }))
+    }
+    else {
+        log.warn "No bwa index beside ${fasta} - building it (once; it is not part of the measurement)."
+        BWA_INDEX(channel.value(fasta))
+        index_ch = BWA_INDEX.out.index.first()
     }
 
     // BWA_MEM emits tuple(meta, bam) only, so index it to get a .bai. That
     // index step is also a second, smaller read of the BAM just written, which
     // is a realistic part of the IO profile.
-    BWA_MEM(aln_in.reads, aln_in.index)
+    BWA_MEM(reads_ch, index_ch)
     SAMTOOLS_INDEX(BWA_MEM.out.bam)
 
     // The only QC kept: cheap, and read counts are how the hot and cold
@@ -251,6 +282,20 @@ workflow pacbio {
         samplesheet_ch = PREPARE_SAMPLESHEET_PACBIO.out.csv
     }
 
+    // Reuse the .fai beside the fasta, or build it once. See the illumina arm
+    // for why an on-demand index does not distort these measurements.
+    def fasta = requireFasta(params.references.pacbio)
+    def fai   = file("${fasta}.fai")
+
+    if (fai.exists()) {
+        fasta_ch = channel.value(tuple(fasta, fai))
+    }
+    else {
+        log.warn "No .fai beside ${fasta} - building it (once; it is not part of the measurement)."
+        SAMTOOLS_FAIDX(channel.value(tuple([id: fasta.name], fasta)))
+        fasta_ch = SAMTOOLS_FAIDX.out.fai.map { _meta, f -> tuple(fasta, f) }.first()
+    }
+
     reads_ch = readSamplesheet(samplesheet_ch)
         .map { row ->
             // platform and preset are read by both aligner modules: minimap2
@@ -272,20 +317,15 @@ workflow pacbio {
         fastq_ch = reads_ch
     }
 
-    aln_in = fastq_ch.multiMap { meta, reads ->
-        reads: tuple(meta, reads)
-        fasta: faidxFor(meta)
-    }
-
     if (params.device == 'gpu') {
-        PARABRICKS_MINIMAP2(aln_in.reads, aln_in.fasta)
+        PARABRICKS_MINIMAP2(fastq_ch, fasta_ch)
         bam_ch = PARABRICKS_MINIMAP2.out.bam     // tuple(meta, bam, bai)
     }
     else {
         // MINIMAP2_ALIGN emits tuple(meta, bam): its script indexes the BAM but
         // its output block does not declare the .bai, so index it here to reach
         // the same tuple shape as the GPU arm.
-        MINIMAP2_ALIGN(aln_in.reads, aln_in.fasta)
+        MINIMAP2_ALIGN(fastq_ch, fasta_ch)
         SAMTOOLS_INDEX(MINIMAP2_ALIGN.out.bam)
         bam_ch = SAMTOOLS_INDEX.out.bam          // tuple(meta, bam, bai)
     }
@@ -301,9 +341,7 @@ workflow pacbio {
 // uBAM written between the two GPU steps. This is the long pole of the whole
 // benchmark - size the ONT sample set accordingly.
 //
-// The reference needs a samtools .fai beside it on both tiers. faidxFor()
-// checks for it up front, so a missing index fails in seconds rather than
-// after hours of basecalling.
+// The .fai is reused if it sits beside the fasta, and built once if not.
 workflow ont {
 
     if (!params.basecalling.model) {
@@ -321,22 +359,30 @@ workflow ont {
         samplesheet_ch = PREPARE_SAMPLESHEET_ONT.out.csv
     }
 
+    // Reuse the .fai beside the fasta, or build it once. See the illumina arm
+    // for why an on-demand index does not distort these measurements.
+    def fasta = requireFasta(params.references.ont)
+    def fai   = file("${fasta}.fai")
+
+    if (fai.exists()) {
+        fasta_ch = channel.value(tuple(fasta, fai))
+    }
+    else {
+        log.warn "No .fai beside ${fasta} - building it (once; it is not part of the measurement)."
+        SAMTOOLS_FAIDX(channel.value(tuple([id: fasta.name], fasta)))
+        fasta_ch = SAMTOOLS_FAIDX.out.fai.map { _meta, f -> tuple(fasta, f) }.first()
+    }
+
     reads_ch = readSamplesheet(samplesheet_ch)
         .map { row ->
             def meta = [id: row.sample, reference: row.reference]
-            // Resolve the reference and its .fai now, before anything has run
-            faidxFor(meta)
             // `reads` is a POD5 file or a directory of them
             tuple(meta, file(row.reads, checkIfExists: true))
         }
 
     DORADO_BASECALLER(reads_ch)
 
-    aln_in = DORADO_BASECALLER.out.ubam.multiMap { meta, ubam ->
-        reads: tuple(meta, ubam)
-        fasta: faidxFor(meta)
-    }
-    DORADO_ALIGNER(aln_in.reads, aln_in.fasta)
+    DORADO_ALIGNER(DORADO_BASECALLER.out.ubam, fasta_ch)
 
     SAMTOOLS_FLAGSTAT(DORADO_ALIGNER.out.bam.map { meta, bam, _bai -> tuple(meta, bam) })
 }

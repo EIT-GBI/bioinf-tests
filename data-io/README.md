@@ -109,9 +109,16 @@ from those folders.
 | ONT | one **directory** of POD5s per sample, `input/ont/<sample>/` | directory name |
 | ONT (alt) | flat `input/ont/<sample>.pod5` files | basename |
 
-References must already be indexed **on both tiers** (`.amb .ann .bwt .pac .sa`
-for Illumina, `.fai` for all three). Index building is not part of the
-measurement and no timed arm does it.
+Only the reference **fasta** has to be in place on each tier. Indexes are built
+automatically when missing — `bwa index` for the Illumina arm, `samtools faidx`
+for PacBio and ONT — and reused whenever they already sit beside the fasta.
+
+An index built on demand lives in the work dir rather than on the tier, so its
+reads come off Lustre either way. That is negligible for these references (a
+few MB of index against multi-GB read files) and the build is its own process,
+so it never lands inside an alignment's timing. If you ever point this at a
+genome large enough for index reads to matter, pre-build on both tiers with
+`bwa index` / `samtools faidx` so those reads come off the tier under test.
 
 ## Run it on the cluster
 
