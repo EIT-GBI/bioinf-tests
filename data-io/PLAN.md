@@ -32,41 +32,37 @@ Instead: **one Nextflow project with four entry scripts and two params files per
 ```
 data-io/
   PLAN.md
-  README.md                  # setup, run commands, how to read results
-  paths.txt                  # human-readable notes (existing)
-  paths.env                  # the two storage roots, for the bin/ scripts
-  nextflow.config            # containers, resources, and the hot/cold profiles
-  params.yaml                # ONE params file, one block per entry script
-  modules/                   # git submodules, shared by all entries
-    bwa/ samtools/ minimap2/ parabricks/ dorado/ utils/
-    local/verify/            # the read-integrity probe
-    local/samplesheet/       # samplesheet builders (wrap the nf-mod-utils scripts)
-  verify.nf                  # Phase 2: pure read-integrity + throughput probe
-  illumina.nf                # bwa mem -> index -> flagstat
-  pacbio.nf                  # (ubam->fastq) -> minimap2 | pbrun minimap2
-  ont.nf                     # dorado basecaller (sup) -> dorado aligner
-  bin/
-    setup_dirs.sh            # make the test tree on a tier
-    make_manifest.sh         # md5 every input on a tier -> manifest CSV
-    compare_manifests.sh     # byte-identity gate (just `diff`)
-    run.sh                   # run one matrix cell, named and instrumented
-    verify_report.sh         # read verify.nf's CSV, answer the integrity question
-    compare_bam.sh           # BAM body md5, hot vs cold
-    collect_traces.sh        # all traces -> one tidy CSV + summary
-  manifests/                 # committed: md5 of every test input, per tier
-  results/                   # one directory per run (gitignored)
+  README.md              # setup, run commands, how to read results
+  paths.txt              # human-readable notes (existing)
+  main.nf                # six arms, picked with -entry:
+                         #   verify   - integrity + throughput, BOTH tiers
+                         #   illumina - bwa mem -> index -> flagstat
+                         #   pacbio   - (ubam->fastq) -> minimap2 | pbrun
+                         #   ont      - dorado basecaller -> dorado aligner
+                         #   compare  - hot vs cold BAM bodies
+                         #   report   - timing table across runs
+  nextflow.config        # all params, resources, containers, output layout
+  modules/
+    bwa/ samtools/ minimap2/ parabricks/ dorado/ utils/   # nf-mod-* submodules
+    local/processes.nf   # samplesheet builders, VERIFY_*, COMPARE_*, TIMING_*
+    local/*_report.py    # the two report scripts, kept as real python files
+  results/               # traces, verify.csv, the reports (gitignored)
 ```
 
-Run shape: `nextflow run illumina.nf -profile cluster,hot -params-file params.yaml`.
+There are no shell scripts and no pre-steps: stage the reads and run an arm.
+
+
+Run shape: `nextflow run main.nf -entry illumina -profile cluster --tier hot`.
 The tier is one word on the command line; the pipeline code and the params are
 shared. Every path on a tier derives from that tier's single root, set in the
 `hot`/`cold` profile, so there is one place to change and nothing to keep in
 sync. Samplesheets are generated from each tier's input folders, as `nf-dnaseq`
 does from `fastq_dir`, so they cannot drift apart either.
 
-Per-platform entry scripts (rather than one script branching on platform) keeps each main
-bare-bones — the three tool chains have nothing in common, so a shared main would be all
-`if`.
+Per-platform *workflows* (rather than one branching on platform) keep each arm bare-bones —
+the three tool chains have nothing in common, so a merged one would be all `if`. They live
+in one file because they share the includes and the config; `-entry` picks one per run.
+They are not run concurrently: see Phase 4.
 
 ## Module reuse
 
@@ -92,46 +88,40 @@ Two things to know before wiring these up:
   `nf-mod-utils` flavour throughout here — it's the submodule, so it needs no copied code.
 - **Some modules read params directly**, which fixes those param names. The dorado
   basecaller reads `params.basecalling.model` and `.modified_bases`, and every module's
-  `publishDir` reads `params.outdir`. That is why the ONT block in `params.yaml` is called
-  `basecalling` rather than `ont`.
+  `publishDir` reads `params.outdir`. That is why the ONT params block is called
+  `basecalling` rather than `ont`. Conversely, at their pinned releases bwa, samtools,
+  minimap2 and parabricks declare no `publishDir` at all, so the output layout is set in
+  `nextflow.config` — which is also what lets every arm publish its BAM to one
+  `alignment/` folder for `-entry compare` to find.
 - **`minimap2`/`parabricks`/`dorado` have no `conf/module.config`** in the repos that use
   them; those pipelines pin the image inline in `nextflow.config`. Do the same here rather
   than inventing module configs.
 
-Only new code: four short `main`s, the configs, and the `bin/` shell helpers. New
-processes: `VERIFY_READ`, and three thin samplesheet wrappers - two of which just run the
-`nf-mod-utils` python scripts, while the ONT one handles POD5 directories that neither
-script covers.
+Only new code: `main.nf`, `nextflow.config`, and `modules/local/processes.nf`. The new
+processes are `VERIFY_READ` and `VERIFY_REPORT` (integrity), `COMPARE_BAM` (hot vs cold
+outputs), `TIMING_REPORT` (the results table), and three thin samplesheet wrappers — two
+of which just run the `nf-mod-utils` python scripts, while the ONT one handles POD5
+directories that neither script covers. No shell scripts.
 
-## Phase 0 — make paths.txt machine-readable
+The two report processes call real `.py` files rather than embedding python in the script
+block. Inline python breaks in two ways that are easy to miss: a `"""` docstring closes
+the Groovy string, and the block's indentation stripping is fragile.
 
-`data-io/paths.txt` isn't valid shell: `HOT-STORAGE-DIR` can't be a shell variable, and
-`${HOT-STORAGE-DIR}` actually parses as `${HOT}` with a `-STORAGE-DIR` default, so it
-expands to the wrong thing silently. Convert to `paths.env` with underscore names
-(`HOT_STORAGE_DIR`, `INPUT_ONT_DIR_HOT`, ...), keep `paths.txt` as the human-readable
-notes, and let the params YAMLs carry the same paths for Nextflow. The `mkdir -p` lines
-move into a `bin/setup_dirs.sh`.
+## Phase 0/1 — staging, and the byte-identity gate
 
-## Phase 1 — data staging and byte-identity gate
+Both folded into the `verify` arm. There is nothing to run first.
 
-The comparison is only meaningful if both tiers hold the same bytes.
+Staging the reads into `<root>/tests/data-io/input/<platform>/` on both tiers is
+manual on purpose: how the data gets onto Alluxio is itself part of what is under
+suspicion. Everything after that is derived — samplesheets from the folders, paths
+from the tier root.
 
-1. `bin/make_manifest.sh hot` and `... cold` — walk each platform's input dir plus the
-   reference and its index files, emit `manifests/{tier}.csv` with `path,size,md5`.
-2. `bin/compare_manifests.sh` — join on path-relative-to-tier-root, fail loudly on any
-   size or md5 mismatch.
-3. Samplesheets need no attention: each entry script builds its own from that tier's
-   input folder. Only the folder layout matters (see README).
-4. Confirm the references are pre-indexed **on both tiers** (`.fai` for all three; `.amb
-   .ann .bwt .pac .sa` for the Illumina reference). Index building is not part of the test
-   and must not run inside a timed pipeline.
+The byte-identity gate used to be a pair of md5 manifests and a `diff`. It is now
+one of the checks `verify` performs, because it reads both tiers in a single run
+and can compare them directly. That removes the manifest files, their naming, and
+the risk of comparing a stale one.
 
-If step 2 already fails, the corruption is at rest / in staging, not in the read path, and
-the investigation changes shape — that's a useful early answer either way. Run the cold
-manifest twice: **same file, two different md5s across runs is the smoking gun** for
-read-path corruption.
-
-## Phase 2 — `verify.nf`: integrity and raw throughput, no tools
+## Phase 2 — `-entry verify`: integrity and raw throughput, no tools
 
 A single-process pipeline that isolates the filesystem from every tool confound.
 
@@ -139,7 +129,8 @@ A single-process pipeline that isolates the filesystem from every tool confound.
   so throughput comes out as MB/s.
 - `--reps N` re-reads each file N times as separate tasks, so intermittent corruption
   shows up as a checksum that disagrees between reps.
-- Checksums are compared against `manifests/{tier}.csv`, so any mismatch names the file.
+- Both tiers are read in the same run, so `VERIFY_REPORT` compares them directly — no
+  manifest file to build, name or keep in step.
 - Emits one CSV: `file,tier,rep,bytes,seconds,md5,md5_matches_manifest`.
 
 This is cheap, runs in minutes, and is where the Alluxio corruption question actually gets
@@ -155,17 +146,17 @@ and a silently-mangled-bytes bug look different under those.
 Deliberately minimal: no trimming, no QC beyond `flagstat`, no variant calling, no
 coverage tracks. Every extra process adds noise to the IO measurement.
 
-**`illumina.nf`** — samplesheet (`sample,R1,R2,reference`) → `BWA_MEM` → `SAMTOOLS_INDEX`
+**`illumina`** — samplesheet (`sample,R1,R2,reference`) → `BWA_MEM` → `SAMTOOLS_INDEX`
 → `SAMTOOLS_FLAGSTAT`. Reads go straight to `bwa` untrimmed; `fastp` would rewrite the
 FASTQs into the work dir and hide the source filesystem behind a local copy.
 
-**`pacbio.nf`** — samplesheet (`sample,reads,reference`). Input is HiFi uBAM, so
+**`pacbio`** — samplesheet (`sample,reads,reference`). Input is HiFi uBAM, so
 `SAMTOOLS_FASTQ` first (gate behind `--input_type ubam|fastq`, as `nf-dnaseq-long` does),
 then `--device cpu` → `MINIMAP2_ALIGN` or `--device gpu` → `PARABRICKS_MINIMAP2`, then
 `SAMTOOLS_FLAGSTAT`. No `chopper`, for the same reason `fastp` is skipped above. `meta`
 needs `platform: 'pacbio-hifi'` and `preset: 'map-hifi'` — both modules read them.
 
-**`ont.nf`** — samplesheet (`sample,reads,reference`) where `reads` is a POD5 file or dir
+**`ont`** — samplesheet (`sample,reads,reference`) where `reads` is a POD5 file or dir
 → `DORADO_BASECALLER` (sup model, `--modified_bases ''` to keep it to one variable) →
 `DORADO_ALIGNER` → `SAMTOOLS_FLAGSTAT`. This is the long pole; expect hours per rep, so
 size the ONT sample set with that in mind.
@@ -202,12 +193,12 @@ This is where an IO benchmark usually goes wrong. Controls:
 - **No `-resume`**, fresh work dir per run, unique `-name` per run.
 - 3 reps per cell. Matrix: `3 platforms × 2 tiers × {cpu,gpu where applicable} × 3 reps`
   = 24 pipeline runs (Illumina CPU-only, PacBio both devices, ONT GPU-only), plus the
-  `verify.nf` sweeps.
+  `verify` sweeps.
 
-Instrumentation is handled by `bin/run.sh`, which passes `-with-trace`, `-with-report`
-and `-with-timeline` into that run's own results directory and records total wall clock
-(Nextflow's startup and staging are part of the user experience and are not in the trace).
-The trace gives per-task `realtime`, `%cpu`, `rchar`/`wchar`, `read_bytes`/`write_bytes`,
+Instrumentation is on by default in `nextflow.config`: every run writes a trace, an HTML
+report and a timeline into `params.results`, named `<kind>-<tier>-rep<N>-<timestamp>`. The
+tier and rep in the filename are how `-entry report` knows what a trace was, so no
+bookkeeping file is needed. The trace gives per-task `realtime`, `%cpu`, `rchar`/`wchar`, `read_bytes`/`write_bytes`,
 `syscr`/`syscw` — enough to compute effective MB/s per process and to tell "slow because
 IO" from "slow because it waited". It is written with `raw = true`, so durations are plain
 milliseconds and sizes plain bytes; that is what keeps `collect_traces.sh` short instead
@@ -215,14 +206,15 @@ of parsing `"2m 30s"` and `"1.2 GB"` back into numbers.
 
 ## Phase 5 — output integrity and reporting
 
-- `bin/compare_bam.sh` — for each sample, compare the hot and cold BAM by **body**
+- `-entry compare` — for each sample, compare the hot and cold BAM by **body**
   (`samtools view <bam> | md5sum`), not by file md5: the `@PG` header records the command
   line, which contains tier-specific paths and will always differ. Plus a `flagstat` diff
   as a human-readable cross-check. Identical bodies across tiers is the strong statement
   that cold reads are trustworthy under real load.
-- `bin/collect_traces.sh` — all trace files → one tidy CSV
+- `-entry report` — all trace files → one tidy CSV
   (`run_id,workload,tier,device,rep,run_ok,process,sample,realtime_s,cpu_pct,read_mb,write_mb,read_mb_per_s`),
-  joined to each run's `run.meta` so one row is one task with its tier and rep attached.
+  with the tier and rep taken from each trace's filename, so one row is one task with its
+  run identity attached.
 - `README.md` — the run matrix as copy-pasteable commands, and a results table:
   per platform/process, hot vs cold median realtime, ratio, and effective MB/s, with
   first-touch and warm split out.
@@ -238,7 +230,7 @@ of parsing `"2m 30s"` and `"1.2 GB"` back into numbers.
 3. **Illumina GPU arm** — you specified `bwa` only, so `parabricks fq2bam` is out. It'd be
    a cheap addition (`--device gpu`, module already in `nf-dnaseq`) and would make the
    Illumina row comparable to PacBio's CPU/GPU pair. Say if you want it.
-4. **Whether `verify.nf` should also run as a plain sbatch array** rather than Nextflow,
+4. **Whether `verify` should also run as a plain sbatch array** rather than Nextflow,
    to remove Nextflow's own staging from the integrity probe entirely. Nextflow stages
    inputs as symlinks, so the read already goes through the tier under test rather than a
    local copy — but an sbatch array would remove the question altogether.

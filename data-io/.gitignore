@@ -3,10 +3,7 @@
 .nextflow.log*
 work/
 
-# Benchmark output: traces, reports and tidy CSVs are the results, but they are
-# large and machine-specific. Commit the summary tables in README.md instead,
-# and keep raw runs out of git.
+# Benchmark output: traces, reports and the collected CSVs are the results, but
+# they are large and machine-specific. Commit the summary in README.md instead.
 results/*
 !results/.gitkeep
-
-# Manifests ARE committed: they are the byte-identity gate for the test data.
