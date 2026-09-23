@@ -131,8 +131,7 @@ nextflow pull EIT-GBI/bioinf-tests               # once, so the runs below agree
 NF="nextflow run EIT-GBI/bioinf-tests -main-script data-io/main.nf -profile cluster -resume"
 
 sbatch -J nf-io -p cpu -t 4-00:00:00 --wrap="
-  $NF --arm verify
-  for tier in hot cold; do
+  for tier in cold hot; do
     $NF --arm illumina --tier \$tier
     $NF --arm pacbio   --tier \$tier --device cpu
     $NF --arm pacbio   --tier \$tier --device gpu
@@ -179,8 +178,25 @@ row per task for anything more detailed.
 - **Compute-bound arms hide storage differences.** If `BWA_MEM` runs at 1200%
   CPU, four-times-slower storage can vanish into the alignment work. The wall
   clock per arm is the number that answers "should we use Alluxio".
-- **First touch vs warm.** Alluxio caches on first read, so a `verify` run warms
-  everything it touches. A workload arm run afterwards measures a warm cache.
+- **First touch vs warm — the biggest caveat in the whole benchmark.** Alluxio
+  caches on first read, so every number here is a *warm* number unless the cache
+  was cleared first. That matters because a production pipeline usually pulls
+  each file once: the first touch is both slower and the case most likely to
+  fail. `verify` reports rep 1 separately from later reps so the gap is visible,
+  but a small gap only proves the cache was already warm.
+
+  To measure a genuine first touch, one of:
+
+  ```bash
+  alluxio fs free /path/to/tests/data-io/input    # evict from cache, keep in UFS
+  ```
+
+  ...or point the run at data that has never been read. Then `--reps 2` gives
+  you first-touch and warm side by side in one run.
+
+  **Order matters:** `verify` reads every input on both tiers, so running it
+  first warms everything and the workload arms that follow measure a warm cache.
+  Free the cache between them, or run the workload arm you care about first.
 - **The work dir must stay on Lustre.** Nextflow polls each task's work
   directory for its `.exitcode` file, and Alluxio — a cache over object storage
   — does not give that the immediate metadata visibility it needs. Tasks then

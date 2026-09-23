@@ -91,19 +91,39 @@ if not bad:
 
 say("")
 say("4. READ THROUGHPUT")
+say("   %-5s %-5s %6s %10s %9s %9s" % ("tier", "rep", "reads", "median", "p10", "p90"))
+med = {}
 for tier in ("hot", "cold"):
-    s = [float(r["mb_per_s"]) for r in rows if r["tier"] == tier and float(r["mb_per_s"]) > 0]
-    if s:
-        s.sort()
-        say("   %-4s %5d reads   median %6.1f MB/s   p10 %6.1f   p90 %6.1f"
-            % (tier, len(s), statistics.median(s), s[len(s) // 10], s[9 * len(s) // 10]))
-h = [float(r["mb_per_s"]) for r in rows if r["tier"] == "hot" and float(r["mb_per_s"]) > 0]
-c = [float(r["mb_per_s"]) for r in rows if r["tier"] == "cold" and float(r["mb_per_s"]) > 0]
-if h and c:
-    say("   hot is %.1fx faster than cold at raw sequential reads." %
-        (statistics.median(h) / statistics.median(c)))
-say("   Both tiers are read in the same run, so they compete with each other;")
-say("   treat this as indicative and use --arm summary for workload timings.")
+    for rep in reps:
+        s = sorted(float(r["mb_per_s"]) for r in rows
+                   if r["tier"] == tier and r["rep"] == rep and float(r["mb_per_s"]) > 0)
+        if not s:
+            continue
+        med[(tier, rep)] = statistics.median(s)
+        say("   %-5s %-5s %6d %9.1f %9.1f %9.1f MB/s"
+            % (tier, rep, len(s), statistics.median(s), s[len(s) // 10], s[9 * len(s) // 10]))
+
+if ("hot", reps[0]) in med and ("cold", reps[0]) in med:
+    say("   rep %s: hot is %.1fx faster than cold." %
+        (reps[0], med[("hot", reps[0])] / med[("cold", reps[0])]))
+
+# rep 1 is only a first-touch measurement if the cache was cold beforehand
+if len(reps) > 1:
+    say("")
+    say("   CACHE EFFECT (rep 1 vs later reps)")
+    for tier in ("hot", "cold"):
+        first = med.get((tier, reps[0]))
+        later = [med[(tier, r)] for r in reps[1:] if (tier, r) in med]
+        if first and later:
+            say("      %-5s rep1 %6.1f -> warm %6.1f MB/s  (%.1fx)"
+                % (tier, first, statistics.mean(later), statistics.mean(later) / first))
+    say("      A large gap on cold means rep 1 was a genuine cache miss. No gap")
+    say("      means the cache was already warm and rep 1 is NOT a first touch.")
+
+say("")
+say("   Caveats: both tiers are read in the same run, so they compete with each")
+say("   other; and Alluxio caches on first read, so any file read by an earlier")
+say("   run is warm. Free the cache first for a true first-touch number.")
 
 say("")
 say("=" * 64)
