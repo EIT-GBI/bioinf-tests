@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Turn verify.csv into the integrity answer.
+"""Turn reads.csv into the integrity answer.
 
-Usage: verify_report.py <verify.csv>
+Usage: verify_report.py <reads.csv>
 
 Checks, in order of how much they matter:
-  1. Same file, same tier, different md5 between reps. The bytes on disk cannot
-     have changed, so the read path returned something it made up.
-  2. Same file, different md5 between hot and cold. One tier is not holding what
-     the other is - corruption at rest, in staging, or on every read.
+  1. Hot vs cold mismatch - the tiers are not holding the same bytes.
+  2. Cross-rep disagreement (only meaningful with --reps 2 or more) - the same
+     file read twice giving two different md5s. The bytes on disk cannot have
+     changed, so the read path returned something it made up.
   3. Failed reads and format checks, which tell a truncated read from a mangled
-     one.
-Then throughput, the probe's secondary purpose.
+     one. A file that fails identically on BOTH tiers with the SAME md5 is a bad
+     input file, not a storage fault - the report says so rather than blaming
+     the filesystem.
 """
 
 import collections
@@ -19,81 +20,96 @@ import statistics
 import sys
 
 rows = list(csv.DictReader(open(sys.argv[1])))
-out = []
-problems = 0
+out, problems = [], 0
+say = out.append
 
+reps = sorted({r["rep"] for r in rows})
+size = sum(int(r["bytes"]) for r in rows if r["tier"] == "hot" and r["rep"] == reps[0])
 
-def say(s=""):
-    out.append(s)
+say("=" * 64)
+say(" verify - %d reads, %d files per tier, %.1f GB, %d rep(s)"
+    % (len(rows), len(rows) // (2 * len(reps)), size / 2**30, len(reps)))
+say("=" * 64)
 
-
-say("=" * 62)
-say(" verify report - %d reads" % len(rows))
-say("=" * 62)
-
-# Distinct checksums seen for each (tier, file)
+# md5s seen per (tier, file)
 seen = collections.defaultdict(set)
 for r in rows:
     seen[(r["tier"], r["rel"])].add(r["md5"])
 
-say()
-say("1. CROSS-REP DISAGREEMENT (same file read twice, two different md5s)")
-disagreeing = {k: v for k, v in seen.items() if len(v) > 1}
-for (tier, rel), md5s in sorted(disagreeing.items()):
-    say("   %-5s %s" % (tier, rel))
-    say("         %s" % "  ".join(sorted(md5s)))
-problems += len(disagreeing)
-if not disagreeing:
-    say("   none - every file checksummed identically across all reps.")
-
-say()
-say("2. HOT vs COLD MISMATCH")
-mismatched, unpaired = [], []
+say("")
+say("1. HOT vs COLD")
+mismatch, only_one = [], []
 for rel in sorted({rel for _, rel in seen}):
     hot, cold = seen.get(("hot", rel)), seen.get(("cold", rel))
     if not hot or not cold:
-        unpaired.append((rel, "hot" if hot else "cold"))
+        only_one.append((rel, "hot" if hot else "cold"))
     elif hot != cold:
-        mismatched.append((rel, sorted(hot), sorted(cold)))
-for rel, hot, cold in mismatched:
+        mismatch.append((rel, sorted(hot), sorted(cold)))
+for rel, h, c in mismatch:
     say("   MISMATCH %s" % rel)
-    say("            hot  %s" % " ".join(hot))
-    say("            cold %s" % " ".join(cold))
-for rel, where in unpaired:
-    say("   ONLY ON %-5s %s" % (where, rel))
-problems += len(mismatched) + len(unpaired)
-if not mismatched and not unpaired:
-    say("   none - both tiers hold the same bytes for every file.")
+    say("            hot  %s" % " ".join(h))
+    say("            cold %s" % " ".join(c))
+for rel, where in only_one:
+    say("   ONLY ON %-4s %s" % (where, rel))
+problems += len(mismatch) + len(only_one)
+if not mismatch and not only_one:
+    say("   PASS - both tiers hold identical bytes for every file.")
 
-say()
-say("3. FAILED READS AND FORMAT CHECKS")
-failed = [r for r in rows if r["md5"] == "READ_FAILED" or r["check_ok"] == "no"]
-for r in failed:
-    say("   %-5s %s  (%s)" % (r["tier"], r["rel"], r["check_type"]))
-problems += len(failed)
-if not failed:
-    say("   none.")
+say("")
+say("2. REPEATED READS")
+if len(reps) < 2:
+    say("   skipped (one rep). Use --reps 2 to re-read every file and catch a")
+    say("   read path that returns different bytes on different reads.")
+else:
+    flaky = {k: v for k, v in seen.items() if len(v) > 1}
+    for (tier, rel), md5s in sorted(flaky.items()):
+        say("   UNSTABLE %-4s %s" % (tier, rel))
+        say("            %s" % "  ".join(sorted(md5s)))
+    problems += len(flaky)
+    if not flaky:
+        say("   PASS - every file checksummed identically on every read.")
 
-say()
-say("4. THROUGHPUT")
-for tier in ("hot", "cold"):
-    # Files too small to time report 0 and would drag the median down
-    speeds = [float(r["mb_per_s"]) for r in rows
-              if r["tier"] == tier and float(r["mb_per_s"]) > 0]
-    if speeds:
-        say("   %-5s %d timed reads: median %.1f MB/s, range %.1f - %.1f"
-            % (tier, len(speeds), statistics.median(speeds), min(speeds), max(speeds)))
+say("")
+say("3. FORMAT CHECKS")
+bad = [r for r in rows if r["md5"] == "READ_FAILED" or r["ok"] == "no"]
+# A file bad on both tiers with one md5 is a bad file, not a storage problem
+by_file = collections.defaultdict(list)
+for r in bad:
+    by_file[r["rel"]].append(r)
+for rel, rs in sorted(by_file.items()):
+    tiers = {r["tier"] for r in rs}
+    md5s = {r["md5"] for r in rs}
+    if tiers == {"hot", "cold"} and len(md5s) == 1:
+        say("   BAD INPUT  %s" % rel)
+        say("              fails on both tiers with the same checksum - the file")
+        say("              itself is malformed, not the storage. Not counted below.")
     else:
-        say("   %-5s no files large enough to time." % tier)
-say("   Indicative only: this run reads BOTH tiers at once, so hot and cold")
-say("   tasks compete with each other as well as with their own siblings.")
-say("   The timing evidence is `--arm report`, where one tier runs at a time.")
+        say("   FAILED     %-4s %s (%s)" % (rs[0]["tier"], rel, rs[0]["check"]))
+        problems += len(rs)
+if not bad:
+    say("   PASS - nothing failed gzip -t or samtools quickcheck.")
 
-say()
-say("=" * 62)
-say(" PASS: both tiers returned consistent, intact bytes." if problems == 0 else
-    " FAIL: %d problem(s). Do not trust timings until this is understood." % problems)
-say("=" * 62)
+say("")
+say("4. READ THROUGHPUT")
+for tier in ("hot", "cold"):
+    s = [float(r["mb_per_s"]) for r in rows if r["tier"] == tier and float(r["mb_per_s"]) > 0]
+    if s:
+        s.sort()
+        say("   %-4s %5d reads   median %6.1f MB/s   p10 %6.1f   p90 %6.1f"
+            % (tier, len(s), statistics.median(s), s[len(s) // 10], s[9 * len(s) // 10]))
+h = [float(r["mb_per_s"]) for r in rows if r["tier"] == "hot" and float(r["mb_per_s"]) > 0]
+c = [float(r["mb_per_s"]) for r in rows if r["tier"] == "cold" and float(r["mb_per_s"]) > 0]
+if h and c:
+    say("   hot is %.1fx faster than cold at raw sequential reads." %
+        (statistics.median(h) / statistics.median(c)))
+say("   Both tiers are read in the same run, so they compete with each other;")
+say("   treat this as indicative and use --arm summary for workload timings.")
+
+say("")
+say("=" * 64)
+say(" PASS - no integrity problem found." if problems == 0 else
+    " FAIL - %d problem(s)." % problems)
+say("=" * 64)
 
 text = "\n".join(out)
 print(text)

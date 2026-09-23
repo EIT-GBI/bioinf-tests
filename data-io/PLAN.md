@@ -31,23 +31,20 @@ Instead: **one Nextflow project with four entry scripts and two params files per
 
 ```
 data-io/
-  PLAN.md
-  README.md              # setup, run commands, how to read results
-  paths.txt              # human-readable notes (existing)
-  main.nf                # six arms, picked with --arm:
-                         #   verify   - integrity + throughput, BOTH tiers
-                         #   illumina - bwa mem -> index -> flagstat
-                         #   pacbio   - (ubam->fastq) -> minimap2 | pbrun
-                         #   ont      - dorado basecaller -> dorado aligner
-                         #   compare  - hot vs cold BAM bodies
-                         #   report   - timing table across runs
-  nextflow.config        # all params, resources, containers, output layout
+  main.nf                five arms: verify, illumina, pacbio, ont, summary
+  nextflow.config        every parameter, path, container and resource
   modules/
-    bwa/ samtools/ minimap2/ parabricks/ dorado/ utils/   # nf-mod-* submodules
-    local/processes.nf   # samplesheet builders, VERIFY_*, COMPARE_*, TIMING_*
-    local/*_report.py    # the two report scripts, kept as real python files
-  results/               # traces, verify.csv, the reports (gitignored)
+    bwa/ samtools/ minimap2/ parabricks/ dorado/ utils/   nf-mod-* submodules
+    local/processes.nf   samplesheet builders, READ_FILE, COMPARE_BAM, reports
+    local/verify_report.py   the integrity answer
+    local/summary.py         hot vs cold, in one file
 ```
+
+Reads come from `--tier`; everything written goes to `--out_tier` (cold by
+default), into one results tree with one folder per run — `hot-illumina/`,
+`cold-pacbio-gpu/`, `verify/`, `summary/`. Nothing is written to the launch
+directory, and re-running an arm overwrites its own folder.
+
 
 There are no shell scripts and no pre-steps: stage the reads and run an arm.
 

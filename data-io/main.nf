@@ -3,108 +3,87 @@
 // ---------------------------------------------------------------------------
 // data-io - hot (Lustre) vs cold (Alluxio) storage IO benchmark
 // ---------------------------------------------------------------------------
-//   nextflow run main.nf --arm verify                   # both tiers, integrity
-//   nextflow run main.nf --arm illumina --tier hot
-//   nextflow run main.nf --arm pacbio   --tier cold --device gpu
-//   nextflow run main.nf --arm ont      --tier hot
-//   nextflow run main.nf --arm compare                  # hot vs cold outputs
-//   nextflow run main.nf --arm report                   # timing table
+// Two questions, in order:
+//   1. Does Alluxio hand back the bytes it was given?   -> --arm verify
+//   2. How much slower is it for real workloads?        -> the workload arms
 //
-// The arm is a parameter, not `-entry`. Nextflow 26's strict syntax removed
-// `-entry` and says to "use a param to run a named workflow from the entry
-// workflow", which is what the dispatch below does. It also works on older
-// Nextflow, and it puts the arm in `params`, so the config can name the trace
-// files and output directories after it.
+//   --arm verify     read every input on BOTH tiers, checksum and time it
+//   --arm illumina   bwa mem
+//   --arm pacbio     minimap2, or Parabricks with --device gpu
+//   --arm ont        dorado sup basecalling, then dorado aligner
+//   --arm summary    hot vs cold: timings, throughput, output checksums
 //
-// Nothing to run before or after: stage the reads into
-// <root>/tests/data-io/input/<platform>/ and each arm builds its own
-// samplesheet, writes its own trace, and reports its own result.
+// One arm per run. The arms have no dependency on each other, but running
+// different workloads at once would measure "three workloads saturating this
+// filesystem" rather than how it serves any one of them. Within an arm, samples
+// fan out normally - that concurrency is the realistic condition.
 //
-// ONE WORKLOAD ARM PER RUN, deliberately. The arms have no dependency on each
-// other and could run together, but different workloads reading at once would
-// measure "three workloads saturating this filesystem" rather than "how fast
-// this filesystem serves bwa", and a slowdown could not be attributed to an
-// access pattern. Within an arm, samples fan out exactly as in a normal run -
-// tens of tasks at once, as many as SLURM grants - because that concurrency is
-// the realistic condition.
-//
-// The tier is a parameter, never a second copy of the code: both arms must run
-// byte-identical code or code drift confounds the comparison.
+// Reads come from --tier. Everything written - work dir and results - goes to
+// --out_tier (cold by default), so there is one results tree with one folder
+// per run: results/hot-illumina/, results/cold-illumina/, results/verify/ ...
 // ---------------------------------------------------------------------------
 
-include { PREPARE_SAMPLESHEET_ILLUMINA } from './modules/local/processes.nf'
-include { PREPARE_SAMPLESHEET_PACBIO }   from './modules/local/processes.nf'
-include { PREPARE_SAMPLESHEET_ONT }      from './modules/local/processes.nf'
-include { VERIFY_READ; VERIFY_REPORT }   from './modules/local/processes.nf'
-include { COMPARE_BAM; TIMING_REPORT }   from './modules/local/processes.nf'
+include { SAMPLESHEET_SHORT; SAMPLESHEET_LONG; SAMPLESHEET_POD5 } from './modules/local/processes.nf'
+include { READ_FILE; COMPARE_BAM; REPORT_VERIFY; REPORT_SUMMARY } from './modules/local/processes.nf'
 
-include { BWA_MEM }             from './modules/bwa/mem/main.nf'
 include { BWA_INDEX }           from './modules/bwa/index/main.nf'
+include { BWA_MEM }             from './modules/bwa/mem/main.nf'
 include { MINIMAP2_ALIGN }      from './modules/minimap2/align/main.nf'
 include { PARABRICKS_MINIMAP2 } from './modules/parabricks/minimap2/main.nf'
 include { DORADO_BASECALLER }   from './modules/dorado/basecaller/main.nf'
 include { DORADO_ALIGNER }      from './modules/dorado/aligner/main.nf'
-include { SAMTOOLS_FASTQ }      from './modules/samtools/fastq/main.nf'
-include { SAMTOOLS_INDEX }      from './modules/samtools/index/main.nf'
 include { SAMTOOLS_FAIDX }      from './modules/samtools/faidx/main.nf'
+include { SAMTOOLS_FASTQ }      from './modules/samtools/fastq/main.nf'
 include { SAMTOOLS_FLAGSTAT }   from './modules/samtools/flagstat/main.nf'
+include { SAMTOOLS_INDEX }      from './modules/samtools/index/main.nf'
 
 
+// --- small helpers ---------------------------------------------------------
 
-// Rows shared by all three workload samplesheets. A '#' row is dropped because
-// CSV has no comment syntax, so such a line would become a sample named "# ...".
-def readSamplesheet(samplesheet_ch) {
-    samplesheet_ch
-        .splitCsv(header: true)
-        .filter { row -> row.sample && !row.sample.startsWith('#') }
+def inputDir(tier){ "${tier == 'cold' ? params.cold_root : params.hot_root}/tests/data-io/input" }
+def scriptIn(name){ file("${projectDir}/modules/local/${name}", checkIfExists: true) }
+
+// Rows of a generated samplesheet. '#' rows are dropped because CSV has no
+// comment syntax, so such a line would otherwise become a sample.
+def sheetRows(ch) {
+    ch.splitCsv(header: true).filter { r -> r.sample && !r.sample.startsWith('#') }
 }
 
-// Resolve an arm's reference, and say something useful when it is not there.
-// The indexes are built on demand (see the arms below); the fasta itself cannot
-// be, so this is the one thing that has to exist up front.
-def requireFasta(String rel) {
-    def fasta = file("${params.reference_dir}/${rel}")
-    if (!fasta.exists()) {
-        error """
-        |Reference missing on the '${params.tier}' tier:
-        |  ${fasta}
-        |
-        |Both tiers need the reference fasta in place. Its indexes do not have
-        |to exist - they are built automatically if absent.
-        """.stripMargin()
+// The reference fasta for an arm. Its indexes are built on demand below; the
+// fasta itself cannot be, so it is the one thing that has to exist.
+def fastaFor(String rel) {
+    def f = file("${params.reference_dir}/${rel}")
+    if (!f.exists()) {
+        error "Reference missing on the '${params.tier}' tier:\n  ${f}"
     }
-    return fasta
+    return f
+}
+
+// The bwa index files if they all sit beside the fasta, else null. Pure on
+// purpose: a function cannot call a process under Nextflow's strict syntax, so
+// each arm does the build itself.
+def bwaIndexFiles(fasta) {
+    def fs = ['amb', 'ann', 'bwt', 'pac', 'sa'].collect { e -> file("${fasta}.${e}") }
+    return fs.every { f -> f.exists() } ? fs : null
 }
 
 
-// Inputs come from the tier under test; everything written lands on Lustre,
-// split by tier so `compare` can still pair the two sides. See nextflow.config.
-def inputDir(tier)  { "${tier == 'cold' ? params.cold_root : params.hot_root}/${params.test_subdir}/input" }
-def outputDir(tier) { "${params.hot_root}/${params.test_subdir}/output/${tier}" }
+// --- entry point -----------------------------------------------------------
 
-
-// ---------------------------------------------------------------------------
-// Entry point: pick an arm
-// ---------------------------------------------------------------------------
 workflow {
-
-    // Declared inside the workflow: Nextflow 26's strict syntax allows function
-    // declarations at the top level but not variable assignments.
-    def arms = ['verify', 'illumina', 'pacbio', 'ont', 'compare', 'report']
+    def arms = ['verify', 'illumina', 'pacbio', 'ont', 'summary']
 
     if (!(params.arm in arms)) {
         error """
         |${params.arm ? "Unknown --arm '${params.arm}'." : 'No --arm given.'}
         |
-        |  --arm verify     both tiers, integrity + throughput      (no --tier)
-        |  --arm illumina   bwa mem                                 --tier hot|cold
-        |  --arm pacbio     minimap2, or Parabricks with --device gpu
-        |  --arm ont        dorado sup basecalling + aligner        --tier hot|cold
-        |  --arm compare    hot vs cold BAM bodies                  (no --tier)
-        |  --arm report     timing table across every run so far    (no --tier)
+        |  --arm verify     integrity + throughput, both tiers   [--reps N]
+        |  --arm illumina   bwa mem                              --tier hot|cold
+        |  --arm pacbio     minimap2 / Parabricks                --tier, --device cpu|gpu
+        |  --arm ont        dorado sup basecalling + aligner     --tier hot|cold
+        |  --arm summary    hot vs cold comparison
         |
-        |One arm per run, on purpose - see the header of this file and README.md.
-        |For the whole matrix in a single job, see README.md.
+        |Results land in <tier root>/tests/data-io/results/<arm>/
         """.stripMargin()
     }
 
@@ -112,355 +91,186 @@ workflow {
     else if (params.arm == 'illumina') { illumina() }
     else if (params.arm == 'pacbio')   { pacbio()   }
     else if (params.arm == 'ont')      { ont()      }
-    else if (params.arm == 'compare')  { compare()  }
-    else if (params.arm == 'report')   { report()   }
+    else if (params.arm == 'summary')  { summary()  }
 }
 
 
-// ---------------------------------------------------------------------------
-// verify - read integrity and raw throughput, both tiers, no tools
-// ---------------------------------------------------------------------------
-// This is where the "Alluxio gave corrupted files" question gets answered, and
-// it runs in minutes rather than hours. Every input file on BOTH tiers is read
-// end to end, checksummed and timed, params.reps times over.
+// --- verify ----------------------------------------------------------------
+// Reads every input on BOTH tiers, checksums and times it. This is where the
+// "Alluxio gave corrupted files" question is answered.
 //
-// Reading both tiers in one run is what removes the old manifest dance: the
-// cross-rep and hot-vs-cold comparisons both happen in VERIFY_REPORT, with no
-// intermediate files to build, name or keep in step.
-//
-// Run it on every partition the workload arms use, the GPU one included:
-// mounts can differ per partition, so a clean CPU-queue result does not cover
-// the Dorado and Parabricks arms.
+// --reps 1 (the default) compares the two tiers against each other. --reps 2 or
+// more additionally re-reads each file, so a file that checksums differently on
+// two reads of the same tier is caught - the signature of a flaky read path.
 workflow verify {
 
-    // Resolved eagerly rather than inside a channel operator, so an empty or
-    // mistyped tier root fails here instead of producing a run that succeeds
-    // with nothing in it. A benchmark that silently measures zero files is
-    // worse than one that stops.
-    def files = ['hot', 'cold'].collectMany { tier ->
-        def base = inputDir(tier)
-        files("${base}/**", type: 'file').collect { f ->
-            tuple(tier, f.toString() - "${base}/", f)
-        }
-    }
-
-    if (!files) {
-        error """No input files found on either tier.
-        |  hot : ${inputDir('hot')}
-        |  cold: ${inputDir('cold')}
-        |Stage the reads there first, or correct --hot_root / --cold_root.""".stripMargin()
-    }
-
-    // tuple(tier, path relative to that tier's input dir, file)
-    files_ch = channel.fromList(files)
-
-    // `as int` is not decoration. Nextflow 26 hands command-line params over as
-    // Strings (25.x coerced them to Integer), and Groovy's `1..'2'` builds a
-    // range to the character's code point - so --verify.reps 2 would quietly
-    // run 50 reps against both tiers instead of 2.
     def reps = params.reps as int
     if (reps < 1) {
         error "--reps must be at least 1, got '${params.reps}'"
     }
 
-    // One task per (tier, file, rep). `rep` rides in meta, which is a val
-    // input, so each rep hashes differently and genuinely re-reads the file
-    // rather than being collapsed into one task.
-    VERIFY_READ(
-        files_ch
+    def files = ['hot', 'cold'].collectMany { tier ->
+        def dir = inputDir(tier)
+        files("${dir}/**", type: 'file').collect { f -> tuple(tier, f.toString() - "${dir}/", f) }
+    }
+    if (!files) {
+        error "No input files under ${inputDir('hot')} or ${inputDir('cold')}"
+    }
+
+    READ_FILE(
+        channel.fromList(files)
             .combine(channel.of(1..reps))
             .map { tier, rel, f, rep -> tuple([tier: tier, rel: rel, rep: rep], f) }
     )
 
-    // Sorted so the two tiers' rows sit next to each other in the CSV
-    csv_ch = VERIFY_READ.out.row.collectFile(
-        name:     'verify.csv',
-        storeDir: params.results,
-        seed:     'tier,rep,rel,bytes,seconds,mb_per_s,md5,check_type,check_ok\n',
-        sort:     true,
-    )
+    csv = READ_FILE.out.row.collectFile(
+        name: 'reads.csv', sort: true, storeDir: params.outdir,
+        seed: 'tier,rep,rel,bytes,seconds,mb_per_s,md5,check,ok\n')
 
-    VERIFY_REPORT(
-        file("${projectDir}/modules/local/verify_report.py", checkIfExists: true),
-        csv_ch
-    )
+    REPORT_VERIFY(scriptIn('verify_report.py'), csv)
 }
 
 
-// ---------------------------------------------------------------------------
-// illumina - bwa mem
-// ---------------------------------------------------------------------------
-// IO character: many small random reads against the bwa index, one large
-// sequential write for the sorted BAM.
-//
-// Deliberately minimal. No fastp, no fastqc, no variant calling: fastp would
-// rewrite both FASTQs into the work dir, and everything downstream would then
-// read Nextflow's local copy rather than the filesystem under test - exactly
-// the thing being measured.
-//
-// The bwa index is reused if it sits beside the fasta, and built once if not.
-// Either way the build is its own process, so it never lands inside an
-// alignment's timing.
+// --- illumina --------------------------------------------------------------
+// IO: many small random reads against the bwa index, one large sequential write.
+// No fastp: it would rewrite both FASTQs into the work dir, and everything
+// downstream would then read that copy instead of the filesystem under test.
 workflow illumina {
 
-    if (params.samplesheet) {
-        samplesheet_ch = channel.fromPath(params.samplesheet, checkIfExists: true)
+    SAMPLESHEET_SHORT(scriptIn('../utils/samplesheet/generate_samplesheet_short.py'),
+                      file("${params.input_dir}/illumina", checkIfExists: true),
+                      params.ref_illumina)
+
+    reads = sheetRows(SAMPLESHEET_SHORT.out.csv).map { r ->
+        tuple([id: r.sample], file(r.R1, checkIfExists: true), file(r.R2, checkIfExists: true))
+    }
+
+    // Reuse the bwa index beside the fasta, or build it once. Built on demand
+    // it lives in the work dir, so its reads come off the output tier either
+    // way - negligible here (a few MB of index against multi-GB reads) and the
+    // build is its own process, so it never lands inside an alignment's timing.
+    def fasta = fastaFor(params.ref_illumina)
+    def idx   = bwaIndexFiles(fasta)
+
+    if (idx) {
+        index = channel.value(tuple(fasta, idx))
     }
     else {
-        PREPARE_SAMPLESHEET_ILLUMINA(
-            file("${projectDir}/modules/utils/samplesheet/generate_samplesheet_short.py", checkIfExists: true),
-            file("${params.input_dir}/illumina", checkIfExists: true),
-            params.references.illumina
-        )
-        samplesheet_ch = PREPARE_SAMPLESHEET_ILLUMINA.out.csv
-    }
-
-    reads_ch = readSamplesheet(samplesheet_ch)
-        .map { row ->
-            def meta = [id: row.sample, reference: row.reference]
-            tuple(meta, file(row.R1, checkIfExists: true), file(row.R2, checkIfExists: true))
-        }
-
-    // Reuse the bwa index sitting next to the fasta, or build it once. Built
-    // on demand it lives in the work dir rather than on the tier, so its reads
-    // come off Lustre either way - negligible here, where the index is a few MB
-    // against multi-GB read files, but pre-build it on both tiers if you ever
-    // point this at a genome large enough for index reads to matter.
-    def fasta    = requireFasta(params.references.illumina)
-    def bwa_exts = ['amb', 'ann', 'bwt', 'pac', 'sa']
-
-    if (bwa_exts.every { ext -> file("${fasta}.${ext}").exists() }) {
-        index_ch = channel.value(tuple(fasta, bwa_exts.collect { ext -> file("${fasta}.${ext}") }))
-    }
-    else {
-        log.warn "No bwa index beside ${fasta} - building it (once; it is not part of the measurement)."
+        log.warn "Building bwa index for ${fasta} (once)."
         BWA_INDEX(channel.value(fasta))
-        index_ch = BWA_INDEX.out.index.first()
+        index = BWA_INDEX.out.index.first()
     }
 
-    // BWA_MEM emits tuple(meta, bam) only, so index it to get a .bai. That
-    // index step is also a second, smaller read of the BAM just written, which
-    // is a realistic part of the IO profile.
-    BWA_MEM(reads_ch, index_ch)
+    BWA_MEM(reads, index)
     SAMTOOLS_INDEX(BWA_MEM.out.bam)
-
-    // The only QC kept: cheap, and read counts are how the hot and cold
-    // outputs get compared afterwards.
-    SAMTOOLS_FLAGSTAT(SAMTOOLS_INDEX.out.bam.map { meta, bam, _bai -> tuple(meta, bam) })
+    SAMTOOLS_FLAGSTAT(SAMTOOLS_INDEX.out.bam.map { m, bam, _bai -> tuple(m, bam) })
 }
 
 
-// ---------------------------------------------------------------------------
-// pacbio - minimap2 (CPU) or pbrun minimap2 (GPU)
-// ---------------------------------------------------------------------------
-// IO character: large sequential reads. The GPU arm is often bound by host
-// bandwidth rather than by the GPU, which makes it the more revealing of the
-// two for a storage comparison.
-//
-// No chopper filtering, for the same reason the illumina arm skips fastp.
-// SAMTOOLS_FASTQ is the exception, and only because HiFi reads arrive as uBAM
-// and neither aligner takes one. It is genuine IO for this workload, so it
-// stays in the timed pipeline as its own process rather than a prep step.
+// --- pacbio ----------------------------------------------------------------
+// IO: large sequential reads. The GPU arm is often bound by host bandwidth
+// rather than the GPU, which makes it the more revealing of the two.
+// HiFi reads arrive as uBAM; SAMTOOLS_FASTQ converts them, and is genuine IO
+// for this workload so it stays in the timed pipeline as its own process.
 workflow pacbio {
 
     if (!(params.device in ['cpu', 'gpu'])) {
-        error "Invalid --device '${params.device}'. Use 'cpu' (minimap2) or 'gpu' (Parabricks)."
-    }
-    if (!(params.input_type in ['ubam', 'fastq'])) {
-        error "Invalid --input_type '${params.input_type}'. Use 'ubam' or 'fastq'."
+        error "Invalid --device '${params.device}'. Use cpu (minimap2) or gpu (Parabricks)."
     }
 
-    if (params.samplesheet) {
-        samplesheet_ch = channel.fromPath(params.samplesheet, checkIfExists: true)
+    SAMPLESHEET_LONG(scriptIn('../utils/samplesheet/generate_samplesheet_long.py'),
+                     file("${params.input_dir}/pacbio", checkIfExists: true),
+                     params.ref_pacbio)
+
+    // uBAM or FASTQ, decided per sample by its extension rather than a flag
+    branched = sheetRows(SAMPLESHEET_LONG.out.csv)
+        .map { r -> tuple([id: r.sample, platform: 'pacbio-hifi', preset: 'map-hifi'],
+                          file(r.reads, checkIfExists: true)) }
+        .branch { _m, f -> ubam: f.name.endsWith('.bam')
+                           fastq: true }
+
+    SAMTOOLS_FASTQ(branched.ubam)
+    fastq = SAMTOOLS_FASTQ.out.reads.mix(branched.fastq)
+
+    def fasta = fastaFor(params.ref_pacbio)
+
+    if (file("${fasta}.fai").exists()) {
+        ref = channel.value(tuple(fasta, file("${fasta}.fai")))
     }
     else {
-        PREPARE_SAMPLESHEET_PACBIO(
-            file("${projectDir}/modules/utils/samplesheet/generate_samplesheet_long.py", checkIfExists: true),
-            file("${params.input_dir}/pacbio", checkIfExists: true),
-            params.references.pacbio
-        )
-        samplesheet_ch = PREPARE_SAMPLESHEET_PACBIO.out.csv
-    }
-
-    // Reuse the .fai beside the fasta, or build it once. See the illumina arm
-    // for why an on-demand index does not distort these measurements.
-    def fasta = requireFasta(params.references.pacbio)
-    def fai   = file("${fasta}.fai")
-
-    if (fai.exists()) {
-        fasta_ch = channel.value(tuple(fasta, fai))
-    }
-    else {
-        log.warn "No .fai beside ${fasta} - building it (once; it is not part of the measurement)."
+        log.warn "Building .fai for ${fasta} (once)."
         SAMTOOLS_FAIDX(channel.value(tuple([id: fasta.name], fasta)))
-        fasta_ch = SAMTOOLS_FAIDX.out.fai.map { _meta, f -> tuple(fasta, f) }.first()
-    }
-
-    reads_ch = readSamplesheet(samplesheet_ch)
-        .map { row ->
-            // platform and preset are read by both aligner modules: minimap2
-            // for -x and the @RG PL tag, Parabricks for --preset.
-            def meta = [
-                id:        row.sample,
-                reference: row.reference,
-                platform:  'pacbio-hifi',
-                preset:    'map-hifi',
-            ]
-            tuple(meta, file(row.reads, checkIfExists: true))
-        }
-
-    if (params.input_type == 'ubam') {
-        SAMTOOLS_FASTQ(reads_ch)
-        fastq_ch = SAMTOOLS_FASTQ.out.reads
-    }
-    else {
-        fastq_ch = reads_ch
+        ref = SAMTOOLS_FAIDX.out.fai.map { _m, f -> tuple(fasta, f) }.first()
     }
 
     if (params.device == 'gpu') {
-        PARABRICKS_MINIMAP2(fastq_ch, fasta_ch)
-        bam_ch = PARABRICKS_MINIMAP2.out.bam     // tuple(meta, bam, bai)
+        PARABRICKS_MINIMAP2(fastq, ref)
+        bam = PARABRICKS_MINIMAP2.out.bam
     }
     else {
         // MINIMAP2_ALIGN emits tuple(meta, bam): its script indexes the BAM but
-        // its output block does not declare the .bai, so index it here to reach
-        // the same tuple shape as the GPU arm.
-        MINIMAP2_ALIGN(fastq_ch, fasta_ch)
+        // does not declare the .bai, so index it to match the GPU arm's shape.
+        MINIMAP2_ALIGN(fastq, ref)
         SAMTOOLS_INDEX(MINIMAP2_ALIGN.out.bam)
-        bam_ch = SAMTOOLS_INDEX.out.bam          // tuple(meta, bam, bai)
+        bam = SAMTOOLS_INDEX.out.bam
     }
 
-    SAMTOOLS_FLAGSTAT(bam_ch.map { meta, bam, _bai -> tuple(meta, bam) })
+    SAMTOOLS_FLAGSTAT(bam.map { m, b, _bai -> tuple(m, b) })
 }
 
 
-// ---------------------------------------------------------------------------
-// ont - dorado sup basecalling, then dorado aligner
-// ---------------------------------------------------------------------------
-// IO character: chunked reads over POD5, sustained for hours, with a large
-// uBAM written between the two GPU steps. This is the long pole of the whole
-// benchmark - size the ONT sample set accordingly.
-//
-// The .fai is reused if it sits beside the fasta, and built once if not.
+// --- ont -------------------------------------------------------------------
+// IO: chunked reads over POD5, sustained for hours, with a large uBAM written
+// between the two GPU steps. The long pole of the whole benchmark.
 workflow ont {
 
-    if (!params.basecalling.model) {
-        error "params.basecalling.model is required"
+    SAMPLESHEET_POD5(file("${params.input_dir}/ont", checkIfExists: true), params.ref_ont)
+
+    reads = sheetRows(SAMPLESHEET_POD5.out.csv).map { r ->
+        tuple([id: r.sample], file(r.reads, checkIfExists: true))
     }
 
-    if (params.samplesheet) {
-        samplesheet_ch = channel.fromPath(params.samplesheet, checkIfExists: true)
+    DORADO_BASECALLER(reads)
+    def fasta = fastaFor(params.ref_ont)
+
+    if (file("${fasta}.fai").exists()) {
+        ref = channel.value(tuple(fasta, file("${fasta}.fai")))
     }
     else {
-        PREPARE_SAMPLESHEET_ONT(
-            file("${params.input_dir}/ont", checkIfExists: true),
-            params.references.ont
-        )
-        samplesheet_ch = PREPARE_SAMPLESHEET_ONT.out.csv
-    }
-
-    // Reuse the .fai beside the fasta, or build it once. See the illumina arm
-    // for why an on-demand index does not distort these measurements.
-    def fasta = requireFasta(params.references.ont)
-    def fai   = file("${fasta}.fai")
-
-    if (fai.exists()) {
-        fasta_ch = channel.value(tuple(fasta, fai))
-    }
-    else {
-        log.warn "No .fai beside ${fasta} - building it (once; it is not part of the measurement)."
+        log.warn "Building .fai for ${fasta} (once)."
         SAMTOOLS_FAIDX(channel.value(tuple([id: fasta.name], fasta)))
-        fasta_ch = SAMTOOLS_FAIDX.out.fai.map { _meta, f -> tuple(fasta, f) }.first()
+        ref = SAMTOOLS_FAIDX.out.fai.map { _m, f -> tuple(fasta, f) }.first()
     }
 
-    reads_ch = readSamplesheet(samplesheet_ch)
-        .map { row ->
-            def meta = [id: row.sample, reference: row.reference]
-            // `reads` is a POD5 file or a directory of them
-            tuple(meta, file(row.reads, checkIfExists: true))
-        }
-
-    DORADO_BASECALLER(reads_ch)
-
-    DORADO_ALIGNER(DORADO_BASECALLER.out.ubam, fasta_ch)
-
-    SAMTOOLS_FLAGSTAT(DORADO_ALIGNER.out.bam.map { meta, bam, _bai -> tuple(meta, bam) })
+    DORADO_ALIGNER(DORADO_BASECALLER.out.ubam, ref)
+    SAMTOOLS_FLAGSTAT(DORADO_ALIGNER.out.bam.map { m, b, _bai -> tuple(m, b) })
 }
 
 
-// ---------------------------------------------------------------------------
-// compare - did the two tiers produce the same alignments?
-// ---------------------------------------------------------------------------
-// Run after the same workload arm has run on both tiers. Pairs every published
-// BAM with its counterpart on the other tier by relative path.
-workflow compare {
+// --- summary ---------------------------------------------------------------
+// Reads what the other arms left on both tiers and answers the whole question
+// in one file: were the outputs identical, and how much slower was cold.
+workflow summary {
 
-    def hot_out  = outputDir('hot')
-    def cold_out = outputDir('cold')
+    def results = "${params.out_base}/results"
 
-    // Each arm publishes under its own directory (see nextflow.config), so the
-    // glob spans them and the key keeps them apart: pacbio-cpu is paired with
-    // pacbio-cpu, not with pacbio-gpu.
-    def hot_bams  = files("${hot_out}/*/alignment/*.bam")
-    def cold_bams = files("${cold_out}/*/alignment/*.bam")
+    // Every run folder is named <tier>-<arm>, so hot-illumina pairs with
+    // cold-illumina once the prefix is stripped from the key.
+    hot_ch  = channel.fromList(files("${results}/hot-*/alignment/*.bam"))
+        .map { f -> tuple(f.toString() - "${results}/hot-", f) }
+    cold_ch = channel.fromList(files("${results}/cold-*/alignment/*.bam"))
+        .map { f -> tuple(f.toString() - "${results}/cold-", f) }
 
-    if (!hot_bams && !cold_bams) {
-        error """No BAMs to compare.
-        |  hot : ${hot_out}/*/alignment/
-        |  cold: ${cold_out}/*/alignment/
-        |Run a workload arm on both tiers first.""".stripMargin()
-    }
+    pairs = hot_ch.join(cold_ch)
 
-    // join silently drops a BAM that exists on only one tier, so say so here.
-    // That case means an arm ran on one tier and not the other, which would
-    // otherwise look like a clean comparison of however many were left.
-    // Key on the path below the tier's output dir, e.g. "illumina/alignment/x.bam"
-    def hot_keys  = hot_bams.collect  { f -> f.toString() - "${hot_out}/"  } as Set
-    def cold_keys = cold_bams.collect { f -> f.toString() - "${cold_out}/" } as Set
-    def unpaired  = (hot_keys - cold_keys) + (cold_keys - hot_keys)
-    if (unpaired) {
-        log.warn "not compared, present on only one tier: ${unpaired.sort().join(', ')}"
-    }
+    COMPARE_BAM(pairs)
 
-    hot_ch  = channel.fromList(hot_bams).map  { f -> tuple(f.toString() - "${hot_out}/",  f) }
-    cold_ch = channel.fromList(cold_bams).map { f -> tuple(f.toString() - "${cold_out}/", f) }
+    bams = COMPARE_BAM.out.row
+        .collectFile(name: 'bams.csv', sort: true,
+                     seed: 'bam,hot_md5,cold_md5,identical,hot_reads,cold_reads\n')
+        .ifEmpty { file("${projectDir}/modules/local/empty.csv") }
 
-    COMPARE_BAM(hot_ch.join(cold_ch))
-
-    COMPARE_BAM.out.row
-        .collectFile(
-            name:     'compare-bam.csv',
-            storeDir: params.results,
-            seed:     'bam,hot_md5,cold_md5,identical,hot_reads,cold_reads\n',
-            sort:     true,
-        )
-        .view { csv ->
-            def rows = csv.readLines().drop(1).findAll { it.trim() }
-            def bad  = rows.count { it.split(',')[3] == 'no' }
-            // An unpaired BAM is not a pass: it was never compared. Saying
-            // "identical" while something went unchecked would be the one
-            // misleading sentence this whole arm exists to avoid.
-            "compare: ${rows.size()} compared, ${bad} differing, ${unpaired.size()} unpaired -> ${csv}\n" +
-            (bad == 0 && !unpaired
-                ? "PASS: the two tiers produced identical alignments."
-                : bad > 0
-                    ? "FAIL: the cold tier did not reproduce the hot tier's output."
-                    : "INCOMPLETE: everything compared matched, but ${unpaired.size()} BAM(s) exist on only one tier.")
-        }
-}
-
-
-// ---------------------------------------------------------------------------
-// report - hot vs cold timings, across every run so far
-// ---------------------------------------------------------------------------
-// Reads the trace files every other run leaves in params.results. The tier and
-// rep come from each filename, so nothing has to be recorded alongside them.
-workflow report {
-
-    traces_ch = channel.fromPath("${params.results}/trace-*.txt", checkIfExists: true).collect()
-
-    TIMING_REPORT(
-        file("${projectDir}/modules/local/timing_report.py", checkIfExists: true),
-        traces_ch
-    )
+    // The traces are read straight from the results tree rather than staged:
+    // the folder names carry the tier and arm, which staging would flatten away.
+    REPORT_SUMMARY(scriptIn('summary.py'), results, bams)
 }
