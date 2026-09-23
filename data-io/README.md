@@ -31,16 +31,20 @@ concurrency is the realistic condition.
 
 ## Where everything lives
 
-**Reads** come from `--tier` (the storage under test). **Results** go to
-`--out_tier`, which defaults to **cold**. The **work dir stays on Lustre**
-regardless, for a reason worth knowing (below).
+**Only reads vary by tier.** Everything written — the work dir and the results —
+goes to Lustre by default, for both arms, so Alluxio is measured as a data
+source rather than used as a working filesystem.
+
+`--out_tier cold` publishes the results to Alluxio instead, if you want to
+exercise writing to it. The work dir stays on Lustre either way — that one is
+not optional (see below).
 
 ```
 <tier root>/tests/data-io/input/<platform>/     reads you stage
 <tier root>/references/                         reference fastas
 
 <lustre>/tests/data-io/work/                    nextflow work dir
-<out root>/tests/data-io/results/               one folder per run:
+<lustre>/tests/data-io/results/                 one folder per run:
     hot-illumina/  cold-illumina/
     hot-pacbio-cpu/  cold-pacbio-gpu/  ...
     verify/  summary/
@@ -66,8 +70,8 @@ the tree stays the size of the matrix.
 |---|---|---|
 | `--arm` | — | which arm to run |
 | `--tier` | `hot` | storage that is **read** — the thing under test |
-| `--out_tier` | `cold` | storage the **results** are published to |
-| `--work_tier` | `hot` | storage for the Nextflow work dir — leave it on Lustre |
+| `--out_tier` | `hot` | storage the **results** are published to; `cold` to write to Alluxio |
+| `--work_dir` | `<hot>/tests/data-io/work` | Nextflow work dir — leave it on Lustre |
 | `--device` | `cpu` | pacbio only: `gpu` uses Parabricks |
 | `--reps` | `1` | verify only: read every file this many times |
 | `--hot_root` / `--cold_root` | see config | the two storage roots |
