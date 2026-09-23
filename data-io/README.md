@@ -12,7 +12,8 @@ the first is answered.
 ## One command
 
 ```bash
-nextflow run <checkout>/data-io/main.nf --arm <arm> -profile cluster -resume
+nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf \
+  --arm <arm> -profile cluster -resume
 ```
 
 | `--arm` | What it does | Options |
@@ -30,14 +31,15 @@ concurrency is the realistic condition.
 
 ## Where everything lives
 
-**Reads** come from `--tier` (the storage under test). **Everything written** —
-work dir and results — goes to `--out_tier`, which defaults to **cold**.
+**Reads** come from `--tier` (the storage under test). **Results** go to
+`--out_tier`, which defaults to **cold**. The **work dir stays on Lustre**
+regardless, for a reason worth knowing (below).
 
 ```
 <tier root>/tests/data-io/input/<platform>/     reads you stage
 <tier root>/references/                         reference fastas
 
-<out root>/tests/data-io/work/                  nextflow work dir
+<lustre>/tests/data-io/work/                    nextflow work dir
 <out root>/tests/data-io/results/               one folder per run:
     hot-illumina/  cold-illumina/
     hot-pacbio-cpu/  cold-pacbio-gpu/  ...
@@ -64,7 +66,8 @@ the tree stays the size of the matrix.
 |---|---|---|
 | `--arm` | — | which arm to run |
 | `--tier` | `hot` | storage that is **read** — the thing under test |
-| `--out_tier` | `cold` | storage that is **written** — work dir and results |
+| `--out_tier` | `cold` | storage the **results** are published to |
+| `--work_tier` | `hot` | storage for the Nextflow work dir — leave it on Lustre |
 | `--device` | `cpu` | pacbio only: `gpu` uses Parabricks |
 | `--reps` | `1` | verify only: read every file this many times |
 | `--hot_root` / `--cold_root` | see config | the two storage roots |
@@ -77,14 +80,31 @@ derives from it, so a wrong one would be silently ignored.
 
 ## Setup
 
+Nothing to clone. Nextflow pulls the pipeline from GitHub and caches it under
+`~/.nextflow/assets/`:
+
 ```bash
-git clone --recursive git@github.com:EIT-GBI/bioinf-tests.git \
-  /mnt/gbi-shared/home/cristian-soitu/code/nf/bioinf-tests
+nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf \
+  --arm verify -profile cluster -resume
 ```
 
-`--recursive` matters: the tool modules are git submodules and three are
-private. This is the only step that touches GitHub; nothing afterwards needs
-credentials. Update with `git pull --recurse-submodules` in that directory.
+- `-main-script data-io/main.nf` — the pipeline lives in a subdirectory of the
+  repo, so Nextflow has to be told which script to run.
+- `-latest` — re-pull the newest commit. **Without it Nextflow silently runs
+  whatever it cached the first time.** The launch banner prints
+  `revision: <sha> [main]`; if that is not the commit you expect, the pull did
+  not happen.
+
+The tool modules are git submodules, fetched automatically because the repo-root
+`nextflow.config` sets `manifest.recurseSubmodules = true`. All seven repos are
+public, so no credentials are needed anywhere.
+
+> **Don't put `-latest` on concurrent runs.** Several `nextflow run` commands
+> racing to update the same cached clone produce
+> `Unknown error accessing project ... Repository may be corrupted`. Run
+> `nextflow pull EIT-GBI/bioinf-tests` once up front, then leave `-latest` off
+> the parallel commands. If it does break, delete
+> `~/.nextflow/assets/EIT-GBI/bioinf-tests` and pull again.
 
 Stage the reads into `<root>/tests/data-io/input/<platform>/` on both tiers:
 
@@ -102,8 +122,9 @@ automatically when their output is missing, and are reused when it is not.
 
 ```bash
 cd /mnt/lustre/projects/bioinformatics/runs      # anywhere; nothing is written here
-PIPELINE=/mnt/gbi-shared/home/cristian-soitu/code/nf/bioinf-tests/data-io/main.nf
-NF="nextflow run $PIPELINE -profile cluster -resume"
+
+nextflow pull EIT-GBI/bioinf-tests               # once, so the runs below agree
+NF="nextflow run EIT-GBI/bioinf-tests -main-script data-io/main.nf -profile cluster -resume"
 
 sbatch -J nf-io -p cpu -t 4-00:00:00 --wrap="
   $NF --arm verify
@@ -156,9 +177,17 @@ row per task for anything more detailed.
   clock per arm is the number that answers "should we use Alluxio".
 - **First touch vs warm.** Alluxio caches on first read, so a `verify` run warms
   everything it touches. A workload arm run afterwards measures a warm cache.
-- **Published files are hard links.** Java 21+ copies with `copy_file_range`,
-  which Lustre answers with `ENODATA`. The work dir and results are on the same
-  tier, so linking works and costs nothing.
+- **The work dir must stay on Lustre.** Nextflow polls each task's work
+  directory for its `.exitcode` file, and Alluxio — a cache over object storage
+  — does not give that the immediate metadata visibility it needs. Tasks then
+  come back as *"terminated for an unknown reason -- Likely it has been
+  terminated by the external system"* with no exit status, even though they ran
+  fine. Results are safe on Alluxio; the work dir is not. `--work_tier` exists
+  only so you can test that claim.
+- **Publishing adapts.** When the work dir and results share a filesystem the
+  files are hard-linked (free); otherwise they are copied. That matters on
+  Lustre, where Java 21+ `copy_file_range` returns `ENODATA` — linking avoids
+  the syscall entirely.
 
 ## Results
 
