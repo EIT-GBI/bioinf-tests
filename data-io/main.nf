@@ -158,7 +158,7 @@ workflow illumina {
     else {
         log.warn "Building bwa index for ${fasta} (once)."
         BWA_INDEX(channel.value(fasta))
-        index = BWA_INDEX.out.index.first()
+        index = BWA_INDEX.out.index
     }
 
     BWA_MEM(reads, index)
@@ -200,7 +200,7 @@ workflow pacbio {
     else {
         log.warn "Building .fai for ${fasta} (once)."
         SAMTOOLS_FAIDX(channel.value(tuple([id: fasta.name], fasta)))
-        ref = SAMTOOLS_FAIDX.out.fai.map { _m, f -> tuple(fasta, f) }.first()
+        ref = SAMTOOLS_FAIDX.out.fai.map { _m, f -> tuple(fasta, f) }
     }
 
     if (params.device == 'gpu') {
@@ -239,7 +239,7 @@ workflow ont {
     else {
         log.warn "Building .fai for ${fasta} (once)."
         SAMTOOLS_FAIDX(channel.value(tuple([id: fasta.name], fasta)))
-        ref = SAMTOOLS_FAIDX.out.fai.map { _m, f -> tuple(fasta, f) }.first()
+        ref = SAMTOOLS_FAIDX.out.fai.map { _m, f -> tuple(fasta, f) }
     }
 
     DORADO_ALIGNER(DORADO_BASECALLER.out.ubam, ref)
