@@ -40,29 +40,32 @@ exercise writing to it. The work dir stays on Lustre either way — that one is
 not optional (see below).
 
 ```
-<tier root>/tests/data-io/input/<platform>/     reads you stage
-<tier root>/references/                         reference fastas
+<hot>/tests/data-io/<--hot_input>/<platform>/     reads you stage
+<cold>/tests/data-io/<--cold_input>/<platform>/
+<tier root>/references/                           reference fastas
 
-<lustre>/tests/data-io/work/                    nextflow work dir
-<lustre>/tests/data-io/results/                 one folder per run:
-    hot-illumina/  cold-illumina/
-    hot-pacbio-cpu/  cold-pacbio-gpu/  ...
-    verify/  summary/
+<lustre>/tests/data-io/work/                      nextflow work dir
+<lustre>/tests/data-io/results/<--results>/       one results set:
+
+    reports/            <- grab this one folder and you have everything
+        hot-illumina/     trace.txt  report.html  timeline.html  samplesheet.csv
+        cold-illumina/    ...
+        verify/           verify-report.txt  reads.csv
+        summary/          summary.txt  tasks.csv
+    data/
+        hot-illumina/     alignment/  qc/  index/
+        cold-illumina/    ...
 ```
 
-The read tier is in the folder name, so hot and cold runs sit side by side in
-one tree. Nothing is written to the directory you launch from.
+Reports and data are separate trees, so `reports/` can be downloaded on its own
+without dragging multi-GB BAMs with it.
 
-Each run folder holds exactly:
+`--results NAME` names the whole set. A new name starts a clean set and leaves
+the previous one untouched, which is how past results are kept — within one set,
+re-running an arm overwrites its own folder rather than leaving a dated copy.
 
-```
-trace.txt  report.html  timeline.html    what the run did
-samplesheet.csv                          what it ran on
-alignment/  qc/  index/                  what it produced
-```
-
-Re-running an arm overwrites its own folder rather than leaving a dated copy, so
-the tree stays the size of the matrix.
+The read tier is in each run folder's name, so hot and cold sit side by side.
+Nothing is written to the directory you launch from.
 
 ## Parameters
 
@@ -74,6 +77,10 @@ the tree stays the size of the matrix.
 | `--work_dir` | `<hot>/tests/data-io/work` | Nextflow work dir — leave it on Lustre |
 | `--device` | `cpu` | pacbio only: `gpu` uses Parabricks |
 | `--reps` | `1` | verify only: read every file this many times |
+| `--results` | `default` | name of the results set — change it to keep a past set |
+| `--cold_input` | `input` | cold dataset dir under `<cold>/tests/data-io/`; point at an unread copy for a first-touch run |
+| `--hot_input` | `input` | same for the hot tier |
+| `--verify_tiers` | `hot,cold` | tiers `--arm verify` reads; `hot` leaves the cold dataset unread |
 | `--hot_root` / `--cold_root` | see config | the two storage roots |
 | `--ref_illumina` / `--ref_pacbio` / `--ref_ont` | see config | reference fasta, relative to `<root>/references/` |
 
@@ -120,7 +127,8 @@ The runs below are sequential, so nothing races.
 > `main` forward will not reliably move them. After a module release, run
 > `nextflow drop EIT-GBI/bioinf-tests` once to force a fresh recursive clone.
 
-Stage the reads into `<root>/tests/data-io/input/<platform>/` on both tiers:
+Stage the reads into `<root>/tests/data-io/<input name>/<platform>/` on both tiers
+(`input` by default; `--cold_input` names a different copy for the cold tier):
 
 | Arm | Layout | Sample name |
 |---|---|---|
@@ -134,29 +142,79 @@ automatically when their output is missing, and are reused when it is not.
 
 ## Running it
 
+Reading a file through Alluxio **caches it**. Every cold number is therefore a
+first-touch number exactly once per copy of the data, and anything that touches
+the cold dataset first — including `--arm verify` — spends it. So the order is:
+
 ```bash
 cd /mnt/lustre/projects/bioinformatics/runs      # anywhere; nothing is written here
 
-# -latest: every run pulls from GitHub. No separate `nextflow pull` step.
 NF="nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf -profile cluster -resume"
+SET="--results 2026-09-25"
 
 sbatch -J nf-io -p cpu -t 4-00:00:00 --wrap="
-  for tier in cold hot; do
-    $NF --arm illumina --tier \$tier
-    $NF --arm pacbio   --tier \$tier --device cpu
-    $NF --arm pacbio   --tier \$tier --device gpu
-    $NF --arm ont      --tier \$tier
-  done
-  $NF --arm summary
+  # 1. hot first. Same code, same references, no cold bytes touched - so a
+  #    broken container or a bad path fails here, not against the one pristine
+  #    copy of the cold data.
+  $NF $SET --arm illumina --tier hot
+  $NF $SET --arm pacbio   --tier hot --device cpu
+  $NF $SET --arm pacbio   --tier hot --device gpu
+  $NF $SET --arm ont      --tier hot
+
+  # 2. cold, on the unread copy. One arm at a time: parallel arms would be
+  #    measuring how the filesystem splits its bandwidth, not how it serves one.
+  COLD=\"$SET --tier cold --cold_input input_uncached1\"
+  $NF \$COLD --arm illumina
+  $NF \$COLD --arm pacbio --device cpu
+  $NF \$COLD --arm ont
+
+  # 3. verify LAST. It reads every file on both tiers, so running it earlier
+  #    would warm the cache for everything above.
+  $NF $SET --arm verify
+  $NF $SET --arm summary
 "
 ```
 
-Nine runs. ONT dominates the budget — time one before committing to the rest.
+### One first touch per copy
 
-To run arms concurrently, give each its own launch directory: Nextflow keeps its
-session cache in `.nextflow/` under the launch dir, so concurrent runs sharing
-one directory all try to resume the same session and all but one die with
-`Unable to acquire lock on session`.
+`--cold_input` exists because a cold measurement cannot be repeated. The second
+run to read a file gets it from cache, whatever the arm. In particular
+`--device cpu` and `--device gpu` read the *same* pacbio input, so only the
+first of the two is a first touch — give the second its own copy:
+
+```bash
+$NF $SET --tier cold --cold_input input_uncached2 --arm pacbio --device gpu
+```
+
+To re-measure anything cold, stage another copy and point `--cold_input` at it.
+`--verify_tiers hot` is there for the same reason: it checksums the hot tier
+without touching cold, if you want an integrity check before the cold arms run.
+
+### Running arms in parallel
+
+Arms are independent, so they can run at once — but they then compete for the
+same filesystem, and the timings stop meaning "how it serves this workload".
+Parallelise the hot validation pass, keep the cold pass sequential.
+
+Give each concurrent run its own launch directory and its own Nextflow home:
+
+```bash
+for arm in illumina pacbio ont; do
+  mkdir -p runs/$arm
+  ( cd runs/$arm && NXF_HOME=$PWD/.nxf sbatch -J nf-$arm -p cpu -t 1-00:00:00 \
+      --wrap="$NF $SET --arm $arm --tier hot" ) &
+done; wait
+```
+
+Both parts matter. Nextflow keeps its session cache in `.nextflow/` under the
+launch dir, so runs sharing one directory all try to resume the same session and
+all but one die with `Unable to acquire lock on session`. And `-latest` makes
+each run update the same cached clone, which races into
+`Unknown error accessing project ... Repository may be corrupted` — a separate
+`NXF_HOME` gives each its own copy.
+
+They still share one work dir and one results set, which is intended: that is
+what lets `--arm summary` see all of them.
 
 ## Reading the results
 

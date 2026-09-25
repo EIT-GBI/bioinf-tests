@@ -40,8 +40,31 @@ include { SAMTOOLS_INDEX }      from './modules/samtools/index/main.nf'
 
 // --- small helpers ---------------------------------------------------------
 
-def inputDir(tier){ "${tier == 'cold' ? params.cold_root : params.hot_root}/tests/data-io/input" }
+// Each tier names its own input dataset, so --cold_input can point at a copy
+// nothing has read yet. Reading through Alluxio caches the file, so a
+// first-touch measurement is only available once per copy of the data.
+def inputDir(tier) {
+    def root = tier == 'cold' ? params.cold_root : params.hot_root
+    def name = tier == 'cold' ? params.cold_input : params.hot_input
+    return "${root}/tests/data-io/${name}"
+}
 def scriptIn(name){ file("${projectDir}/modules/local/${name}", checkIfExists: true) }
+
+// The input directory for one platform on the tier under test. Checked here so
+// a typo in --cold_input names the parameter that is wrong, rather than failing
+// later with a bare path that looks like missing data.
+def inputFor(String platform) {
+    def d = file("${params.input_dir}/${platform}")
+    if (!d.exists()) {
+        def which = params.tier == 'cold' ? '--cold_input' : '--hot_input'
+        error """
+        |No ${platform} input on the '${params.tier}' tier:
+        |  ${d}
+        |Check ${which} (currently '${params.input_name}') and --tier.
+        """.stripMargin()
+    }
+    return d
+}
 
 // Rows of a generated samplesheet. '#' rows are dropped because CSV has no
 // comment syntax, so such a line would otherwise become a sample.
@@ -83,7 +106,10 @@ workflow {
         |  --arm ont        dorado sup basecalling + aligner     --tier hot|cold
         |  --arm summary    hot vs cold comparison
         |
-        |Results land in <tier root>/tests/data-io/results/<arm>/
+        |  --results NAME   results set to write into (default 'default')
+        |  --cold_input DIR the cold dataset directory name (default 'input')
+        |
+        |Reports land in results/<NAME>/reports/<run>/, data in results/<NAME>/data/<run>/
         """.stripMargin()
     }
 
@@ -109,12 +135,27 @@ workflow verify {
         error "--reps must be at least 1, got '${params.reps}'"
     }
 
-    def files = ['hot', 'cold'].collectMany { tier ->
+    // Reading a file warms the Alluxio cache for it, so verify on the cold tier
+    // destroys the first-touch measurement the workload arms are there to take.
+    // --verify_tiers hot leaves the cold dataset untouched; run the cold arms
+    // first, then verify both.
+    def tiers = (params.verify_tiers as String).split(',').collect { t -> t.trim() }.findAll()
+    def unknown = tiers.findAll { t -> !(t in ['hot', 'cold']) }
+    if (!tiers || unknown) {
+        error "--verify_tiers must be hot, cold, or hot,cold - got '${params.verify_tiers}'"
+    }
+    if ('cold' in tiers) {
+        log.warn "verify will read every file under ${inputDir('cold')} and so " +
+                 "WARM the Alluxio cache for it. Run the cold workload arms first " +
+                 "if you still need a first-touch number, or use --verify_tiers hot."
+    }
+
+    def files = tiers.collectMany { tier ->
         def dir = inputDir(tier)
         files("${dir}/**", type: 'file').collect { f -> tuple(tier, f.toString() - "${dir}/", f) }
     }
     if (!files) {
-        error "No input files under ${inputDir('hot')} or ${inputDir('cold')}"
+        error "No input files under ${tiers.collect { t -> inputDir(t) }.join(' or ')}"
     }
 
     READ_FILE(
@@ -124,7 +165,7 @@ workflow verify {
     )
 
     csv = READ_FILE.out.row.collectFile(
-        name: 'reads.csv', sort: true, storeDir: params.outdir,
+        name: 'reads.csv', sort: true, storeDir: params.reportdir,
         seed: 'tier,rep,rel,bytes,seconds,mb_per_s,md5,check,ok\n')
 
     REPORT_VERIFY(scriptIn('verify_report.py'), csv)
@@ -138,7 +179,7 @@ workflow verify {
 workflow illumina {
 
     SAMPLESHEET_SHORT(scriptIn('../utils/samplesheet/generate_samplesheet_short.py'),
-                      file("${params.input_dir}/illumina", checkIfExists: true),
+                      inputFor('illumina'),
                       params.ref_illumina)
 
     reads = sheetRows(SAMPLESHEET_SHORT.out.csv).map { r ->
@@ -179,7 +220,7 @@ workflow pacbio {
     }
 
     SAMPLESHEET_LONG(scriptIn('../utils/samplesheet/generate_samplesheet_long.py'),
-                     file("${params.input_dir}/pacbio", checkIfExists: true),
+                     inputFor('pacbio'),
                      params.ref_pacbio)
 
     // uBAM or FASTQ, decided per sample by its extension rather than a flag
@@ -224,7 +265,7 @@ workflow pacbio {
 // between the two GPU steps. The long pole of the whole benchmark.
 workflow ont {
 
-    SAMPLESHEET_POD5(file("${params.input_dir}/ont", checkIfExists: true), params.ref_ont)
+    SAMPLESHEET_POD5(inputFor('ont'), params.ref_ont)
 
     reads = sheetRows(SAMPLESHEET_POD5.out.csv).map { r ->
         tuple([id: r.sample], file(r.reads, checkIfExists: true))
@@ -252,14 +293,16 @@ workflow ont {
 // in one file: were the outputs identical, and how much slower was cold.
 workflow summary {
 
-    def results = "${params.out_base}/results"
+    // Both trees of this results set: data/ holds the BAMs, reports/ the traces.
+    def data    = "${params.results_base}/data"
+    def reports = "${params.results_base}/reports"
 
     // Every run folder is named <tier>-<arm>, so hot-illumina pairs with
     // cold-illumina once the prefix is stripped from the key.
-    hot_ch  = channel.fromList(files("${results}/hot-*/alignment/*.bam"))
-        .map { f -> tuple(f.toString() - "${results}/hot-", f) }
-    cold_ch = channel.fromList(files("${results}/cold-*/alignment/*.bam"))
-        .map { f -> tuple(f.toString() - "${results}/cold-", f) }
+    hot_ch  = channel.fromList(files("${data}/hot-*/alignment/*.bam"))
+        .map { f -> tuple(f.toString() - "${data}/hot-", f) }
+    cold_ch = channel.fromList(files("${data}/cold-*/alignment/*.bam"))
+        .map { f -> tuple(f.toString() - "${data}/cold-", f) }
 
     pairs = hot_ch.join(cold_ch)
 
@@ -272,5 +315,5 @@ workflow summary {
 
     // The traces are read straight from the results tree rather than staged:
     // the folder names carry the tier and arm, which staging would flatten away.
-    REPORT_SUMMARY(scriptIn('summary.py'), results, bams)
+    REPORT_SUMMARY(scriptIn('summary.py'), reports, bams)
 }

@@ -24,11 +24,14 @@ out, problems = [], 0
 say = out.append
 
 reps = sorted({r["rep"] for r in rows})
-size = sum(int(r["bytes"]) for r in rows if r["tier"] == "hot" and r["rep"] == reps[0])
+n_tiers = len({r["tier"] for r in rows})
+first_tier = sorted({r["tier"] for r in rows})[0]
+size = sum(int(r["bytes"]) for r in rows
+           if r["tier"] == first_tier and r["rep"] == reps[0])
 
 say("=" * 64)
 say(" verify - %d reads, %d files per tier, %.1f GB, %d rep(s)"
-    % (len(rows), len(rows) // (2 * len(reps)), size / 2**30, len(reps)))
+    % (len(rows), len(rows) // (n_tiers * len(reps)), size / 2**30, len(reps)))
 say("=" * 64)
 
 # md5s seen per (tier, file)
@@ -38,8 +41,16 @@ for r in rows:
 
 say("")
 say("1. HOT vs COLD")
+# A run made with --verify_tiers hot holds one tier only. That is a deliberate
+# way to leave the cold dataset unread, not 850 missing files, so say so rather
+# than reporting every file as absent.
+tiers_present = sorted({r["tier"] for r in rows})
 mismatch, only_one = [], []
-for rel in sorted({rel for _, rel in seen}):
+if len(tiers_present) < 2:
+    say("   skipped - this run read the '%s' tier only (--verify_tiers)." % tiers_present[0])
+    say("   Run the other tier into the same results set to compare them.")
+else:
+  for rel in sorted({rel for _, rel in seen}):
     hot, cold = seen.get(("hot", rel)), seen.get(("cold", rel))
     if not hot or not cold:
         only_one.append((rel, "hot" if hot else "cold"))
@@ -52,7 +63,7 @@ for rel, h, c in mismatch:
 for rel, where in only_one:
     say("   ONLY ON %-4s %s" % (where, rel))
 problems += len(mismatch) + len(only_one)
-if not mismatch and not only_one:
+if len(tiers_present) > 1 and not mismatch and not only_one:
     say("   PASS - both tiers hold identical bytes for every file.")
 
 say("")
@@ -100,7 +111,7 @@ say("4. READ THROUGHPUT")
 # this drops exactly the same files from each. It also takes out meta.txt and
 # the near-empty fastqs, whose timings are open/stat latency, not throughput.
 MIN_BYTES = 1 << 20
-per_tier = len(rows) // (2 * len(reps))
+per_tier = len(rows) // (n_tiers * len(reps))
 # Build the eligible set from the FILES, then keep every row belonging to one.
 # A file qualifies only if it is big enough and was timed on every tier and rep,
 # so hot and cold are compared over exactly the same files - no row can be
@@ -109,7 +120,7 @@ rate = {(r["tier"], r["rep"], r["rel"]): float(r["mb_per_s"]) for r in rows}
 eligible = {rel for rel in {r["rel"] for r in rows}
             if int(next(r["bytes"] for r in rows if r["rel"] == rel)) >= MIN_BYTES
             and all(rate.get((t, p, rel), 0) > 0
-                    for t in ("hot", "cold") for p in reps)}
+                    for t in tiers_present for p in reps)}
 timed = [r for r in rows if r["rel"] in eligible]
 say("   Files under %d MiB are excluded - open/stat latency dominates their"
     % (MIN_BYTES >> 20))
