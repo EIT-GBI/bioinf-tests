@@ -82,7 +82,9 @@ for rel, rs in sorted(by_file.items()):
     if tiers == {"hot", "cold"} and len(md5s) == 1:
         say("   BAD INPUT  %s" % rel)
         say("              fails on both tiers with the same checksum - the file")
-        say("              itself is malformed, not the storage. Not counted below.")
+        say("              itself is malformed, not the storage. Not counted as a")
+        say("              problem. Its read still succeeded, so it stays in the")
+        say("              throughput numbers.")
     else:
         say("   FAILED     %-4s %s (%s)" % (rs[0]["tier"], rel, rs[0]["check"]))
         problems += len(rs)
@@ -91,21 +93,63 @@ if not bad:
 
 say("")
 say("4. READ THROUGHPUT")
+# Excluded by SIZE, not by rate. A rate filter is tier-dependent: the same tiny
+# file clears `mb_per_s > 0` on hot and rounds to 0.00 on cold purely because
+# cold is slower, so the two tiers end up with different sample sets - the one
+# bias a storage comparison must not have. Size is identical on both tiers, so
+# this drops exactly the same files from each. It also takes out meta.txt and
+# the near-empty fastqs, whose timings are open/stat latency, not throughput.
+MIN_BYTES = 1 << 20
+per_tier = len(rows) // (2 * len(reps))
+# Build the eligible set from the FILES, then keep every row belonging to one.
+# A file qualifies only if it is big enough and was timed on every tier and rep,
+# so hot and cold are compared over exactly the same files - no row can be
+# present in one arm and absent from the other.
+rate = {(r["tier"], r["rep"], r["rel"]): float(r["mb_per_s"]) for r in rows}
+eligible = {rel for rel in {r["rel"] for r in rows}
+            if int(next(r["bytes"] for r in rows if r["rel"] == rel)) >= MIN_BYTES
+            and all(rate.get((t, p, rel), 0) > 0
+                    for t in ("hot", "cold") for p in reps)}
+timed = [r for r in rows if r["rel"] in eligible]
+say("   Files under %d MiB are excluded - open/stat latency dominates their"
+    % (MIN_BYTES >> 20))
+say("   timings, not bandwidth. The set is chosen by size and applied to both")
+say("   tiers, so hot and cold are always compared over identical files.")
+say("   %d of %d files per tier excluded." % (per_tier - len(eligible), per_tier))
+say("")
 say("   %-5s %-5s %6s %10s %9s %9s" % ("tier", "rep", "reads", "median", "p10", "p90"))
 med = {}
 for tier in ("hot", "cold"):
     for rep in reps:
-        s = sorted(float(r["mb_per_s"]) for r in rows
-                   if r["tier"] == tier and r["rep"] == rep and float(r["mb_per_s"]) > 0)
-        if not s:
+        v = sorted(float(r["mb_per_s"]) for r in timed
+                   if r["tier"] == tier and r["rep"] == rep)
+        if not v:
             continue
-        med[(tier, rep)] = statistics.median(s)
+        med[(tier, rep)] = statistics.median(v)
         say("   %-5s %-5s %6d %9.1f %9.1f %9.1f MB/s"
-            % (tier, rep, len(s), statistics.median(s), s[len(s) // 10], s[9 * len(s) // 10]))
+            % (tier, rep, len(v), statistics.median(v), v[len(v) // 10], v[9 * len(v) // 10]))
 
 if ("hot", reps[0]) in med and ("cold", reps[0]) in med:
     say("   rep %s: hot is %.1fx faster than cold." %
         (reps[0], med[("hot", reps[0])] / med[("cold", reps[0])]))
+
+# Throughput against file size. A cache serves small files best, so if cold is
+# fastest on the small bands and slowest on the large ones, the small-file
+# numbers are cache hits and the large-file number is the honest cold rate.
+BANDS = [(1 << 20, 64 << 20, "1-64 MiB"),
+         (64 << 20, 1 << 30, "64 MiB-1 GiB"),
+         (1 << 30, float("inf"), "> 1 GiB")]
+say("")
+say("   BY FILE SIZE  (rep %s; median MB/s)" % reps[0])
+say("   %-14s %6s %9s %9s %8s" % ("size band", "files", "hot", "cold", "ratio"))
+for lo, hi, label in BANDS:
+    band = [r for r in timed if r["rep"] == reps[0] and lo <= int(r["bytes"]) < hi]
+    h = [float(r["mb_per_s"]) for r in band if r["tier"] == "hot"]
+    c = [float(r["mb_per_s"]) for r in band if r["tier"] == "cold"]
+    if not h or not c:
+        continue
+    mh, mc = statistics.median(h), statistics.median(c)
+    say("   %-14s %6d %9.1f %9.1f %7.2fx" % (label, len(h), mh, mc, mh / mc))
 
 # rep 1 is only a first-touch measurement if the cache was cold beforehand
 if len(reps) > 1:

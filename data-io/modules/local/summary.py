@@ -9,6 +9,12 @@ was cold, and did the two tiers produce the same output.
 Throughput uses `rchar` - bytes read by syscalls. `read_bytes` counts
 block-device IO and reads 0 on Alluxio, which serves over the network, so it
 cannot be compared across the two tiers.
+
+CACHED tasks count. A `-resume` run reports an arm it did not re-execute as
+CACHED, but Nextflow restores the original task's metrics onto those rows, so
+realtime/rchar/%cpu are real measurements and an arm finished in an earlier run
+still gets summarised. Their `start`/`complete` stamps are the *original* run's,
+so wall clock is only reported for runs that were executed end to end.
 """
 
 import csv
@@ -45,12 +51,20 @@ for path in sorted(glob.glob(f"{results}/*/trace.txt")):
     if tier not in ("hot", "cold"):
         continue
     rows = [r for r in csv.DictReader(open(path), delimiter="\t")
-            if r.get("status") == "COMPLETED"]
+            if r.get("status") in ("COMPLETED", "CACHED")]
     if rows:
-        span = (max(int(r["complete"]) for r in rows) -
-                min(int(r["start"]) for r in rows)) / 1000
+        cached = sum(1 for r in rows if r.get("status") == "CACHED")
+        # Sum of task time: valid for cached rows too, and it excludes the
+        # scheduler queueing that wall clock silently includes.
+        task_s = sum(num(r["realtime"]) for r in rows) / 1000
+        # Wall clock spans whichever runs these rows came from, so it only
+        # means anything when every task actually ran in one of them.
+        span = ((max(int(r["complete"]) for r in rows) -
+                 min(int(r["start"]) for r in rows)) / 1000
+                if not cached else None)
         read = sum(num(r["rchar"]) for r in rows) / 2**30
-        runs.append(dict(tier=tier, arm=arm, tasks=len(rows), wall_s=span, read_gb=read))
+        runs.append(dict(tier=tier, arm=arm, tasks=len(rows), cached=cached,
+                         task_s=task_s, wall_s=span, read_gb=read))
 
         for r in rows:
             name = r["process"].split(":")[-1]
@@ -62,7 +76,7 @@ for path in sorted(glob.glob(f"{results}/*/trace.txt")):
                 tier=tier, arm=arm, process=name, sample=r["tag"],
                 realtime_s=round(rt, 1), cpu_pct=num(r["%cpu"]),
                 read_mb=round(rmb, 1), write_mb=round(num(r["wchar"]) / 2**20, 1),
-                read_mb_per_s=round(rmb / rt, 1) if rt else 0))
+                read_mb_per_s=round(rmb / rt, 2) if rt else None))
 
 with open("tasks.csv", "w", newline="") as fh:
     w = csv.DictWriter(fh, fieldnames=FIELDS)
@@ -79,16 +93,29 @@ say("")
 say("1. RUNS FOUND")
 if not runs:
     say("   none. Run a workload arm on each tier first.")
+else:
+    say("   %-4s %-12s %6s %7s %10s %10s %11s"
+        % ("tier", "arm", "tasks", "cached", "task_min", "wall_min", "GiB read"))
 for r in sorted(runs, key=lambda x: (x["arm"], x["tier"])):
-    say("   %-4s %-12s %5d tasks  %7.1f min wall  %8.1f GB read"
-        % (r["tier"], r["arm"], r["tasks"], r["wall_s"] / 60, r["read_gb"]))
+    say("   %-4s %-12s %6d %7d %10.1f %10s %11.1f"
+        % (r["tier"], r["arm"], r["tasks"], r["cached"], r["task_s"] / 60,
+           "%.1f" % (r["wall_s"] / 60) if r["wall_s"] is not None else "-",
+           r["read_gb"]))
+if any(r["cached"] for r in runs):
+    say("")
+    say("   cached > 0 means -resume reused an earlier run's tasks. Their timings")
+    say("   are that run's real measurements, so they are summarised normally;")
+    say("   wall_min reads '-' because the stamps belong to the earlier run.")
 
 say("")
-say("2. WALL CLOCK PER ARM  (what you actually wait for)")
+# Task time, not wall clock: wall clock includes however long SLURM sat on the
+# job, which has nothing to do with the storage under test, and it is unavailable
+# for arms that came back cached.
+say("2. TIME PER ARM  (sum of task time - excludes queue wait)")
 say("   %-14s %10s %10s %8s" % ("arm", "hot_min", "cold_min", "ratio"))
 by_arm = collections.defaultdict(dict)
 for r in runs:
-    by_arm[r["arm"]][r["tier"]] = r["wall_s"] / 60
+    by_arm[r["arm"]][r["tier"]] = r["task_s"] / 60
 for arm in sorted(by_arm):
     h, c = by_arm[arm].get("hot"), by_arm[arm].get("cold")
     say("   %-14s %10s %10s %8s" % (
@@ -96,6 +123,7 @@ for arm in sorted(by_arm):
         "%.1f" % h if h is not None else "-",
         "%.1f" % c if c is not None else "-",
         "%.2fx" % (c / h) if h and c else "-"))
+say("   Wall clock is in section 1; it also counts time queued for a node.")
 
 say("")
 say("3. PER-PROCESS  (median over samples; rate from rchar)")
@@ -106,15 +134,18 @@ for t in tasks:
     grp[(t["process"], t["tier"])].append(t)
 for proc in sorted({p for p, _ in grp}):
     def med(tier, key):
-        v = [x[key] for x in grp.get((proc, tier), []) if x[key] > 0]
+        v = [x[key] for x in grp.get((proc, tier), [])
+             if x["realtime_s"] > 0 and x[key] is not None]
         return statistics.median(v) if v else None
     h, c = med("hot", "realtime_s"), med("cold", "realtime_s")
     hr, cr = med("hot", "read_mb_per_s"), med("cold", "read_mb_per_s")
     say("   %-22s %9s %9s %7s %9s %9s" % (
         proc,
-        "%.1f" % h if h else "-", "%.1f" % c if c else "-",
+        "%.1f" % h if h is not None else "-",
+        "%.1f" % c if c is not None else "-",
         "%.2fx" % (c / h) if h and c else "-",
-        "%.1f" % hr if hr else "-", "%.1f" % cr if cr else "-"))
+        "%.2f" % hr if hr is not None else "-",
+        "%.2f" % cr if cr is not None else "-"))
 say("   ratio > 1 means cold is slower.")
 
 say("")

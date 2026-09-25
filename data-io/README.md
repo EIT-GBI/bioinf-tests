@@ -103,12 +103,22 @@ The tool modules are git submodules, fetched automatically because the repo-root
 `nextflow.config` sets `manifest.recurseSubmodules = true`. All seven repos are
 public, so no credentials are needed anywhere.
 
-> **Don't put `-latest` on concurrent runs.** Several `nextflow run` commands
-> racing to update the same cached clone produce
-> `Unknown error accessing project ... Repository may be corrupted`. Run
-> `nextflow pull EIT-GBI/bioinf-tests` once up front, then leave `-latest` off
-> the parallel commands. If it does break, delete
-> `~/.nextflow/assets/EIT-GBI/bioinf-tests` and pull again.
+`-latest` is what makes each run fetch from GitHub itself, so there is no
+`nextflow pull` step to remember and no way to run a stale commit by accident.
+The runs below are sequential, so nothing races.
+
+> **The one exception: concurrent runs.** Several `nextflow run` commands racing
+> to update the same cached clone produce
+> `Unknown error accessing project ... Repository may be corrupted`. If you run
+> arms in parallel, either give each its own assets dir
+> (`NXF_HOME=$PWD/.nxf-<arm> nextflow run ...`) or pull once up front and leave
+> `-latest` off. If it does break, delete
+> `~/.nextflow/assets/EIT-GBI/bioinf-tests` and run again.
+
+> **When a tool module changes, `-latest` is not enough.** The `nf-mod-*`
+> submodules are resolved when the asset is first cloned, so a pull that moves
+> `main` forward will not reliably move them. After a module release, run
+> `nextflow drop EIT-GBI/bioinf-tests` once to force a fresh recursive clone.
 
 Stage the reads into `<root>/tests/data-io/input/<platform>/` on both tiers:
 
@@ -127,8 +137,8 @@ automatically when their output is missing, and are reused when it is not.
 ```bash
 cd /mnt/lustre/projects/bioinformatics/runs      # anywhere; nothing is written here
 
-nextflow pull EIT-GBI/bioinf-tests               # once, so the runs below agree
-NF="nextflow run EIT-GBI/bioinf-tests -main-script data-io/main.nf -profile cluster -resume"
+# -latest: every run pulls from GitHub. No separate `nextflow pull` step.
+NF="nextflow run EIT-GBI/bioinf-tests -latest -main-script data-io/main.nf -profile cluster -resume"
 
 sbatch -J nf-io -p cpu -t 4-00:00:00 --wrap="
   for tier in cold hot; do
